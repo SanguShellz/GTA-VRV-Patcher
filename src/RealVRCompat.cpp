@@ -221,6 +221,17 @@ static int g_cutsceneScriptCamReset = 0;
 // giving GTA's own handoff (repositioning, animation blend-out) a moment to
 // settle first so we don't fight it mid-transition.
 static int g_cutsceneEndSettleFrames = 2;
+// Optional model-reset fallback for cutscene-end, mirroring VehicleExitModelReset
+// below. OFF by default: SET_PLAYER_MODEL-based ped recreation is a forceful
+// fix with known side effects (see VehicleExitModelReset/Technical.md), so it
+// stays opt-in here too rather than firing unconditionally on every cutscene.
+static int g_cutsceneModelReset = 0;
+// Some cutscenes (e.g. one that ends with the player falling) hand control
+// back while still airborne; applying the heading/camera fix mid-fall fights
+// the landing. We wait for a grounded state first, but cap the wait so a
+// misread air/ground/ragdoll flag can't stall the fix forever - after this
+// many frames we apply it anyway. 0 disables the cap (wait indefinitely).
+static int g_cutsceneGroundWaitMaxFrames = 180; // ~3s @60fps
 // Many in-mission "cutscenes" (dialogue hand-offs, scripted walk-and-talks)
 // never register with IS_CUTSCENE_PLAYING at all - they're just the mission
 // script disabling player control for a while. This treats an extended
@@ -285,6 +296,8 @@ static void LoadPatchConfig() {
     g_cutsceneSoftReset = GetPrivateProfileIntA("patches", "CutsceneSoftReset", 1, iniPath);
     g_cutsceneScriptCamReset = GetPrivateProfileIntA("patches", "CutsceneScriptCamReset", 1, iniPath);
     g_cutsceneEndSettleFrames = GetPrivateProfileIntA("patches", "CutsceneEndSettleFrames", 2, iniPath);
+    g_cutsceneModelReset = GetPrivateProfileIntA("patches", "CutsceneModelReset", 0, iniPath);
+    g_cutsceneGroundWaitMaxFrames = GetPrivateProfileIntA("patches", "CutsceneGroundWaitMaxFrames", 180, iniPath);
     g_controlLossHeadingFix = GetPrivateProfileIntA("patches", "ControlLossHeadingFix", 1, iniPath);
     g_controlLossThresholdFrames = GetPrivateProfileIntA("patches", "ControlLossThresholdFrames", 45, iniPath);
     g_cutsceneRecenterFix = GetPrivateProfileIntA("patches", "CutsceneRecenterFix", 1, iniPath);
@@ -297,6 +310,9 @@ static void LoadPatchConfig() {
     g_controlLossHeadingFix = g_controlLossHeadingFix ? 1 : 0;
     if (g_cutsceneEndSettleFrames < 0) g_cutsceneEndSettleFrames = 0;
     if (g_cutsceneEndSettleFrames > 60) g_cutsceneEndSettleFrames = 60;
+    g_cutsceneModelReset = g_cutsceneModelReset ? 1 : 0;
+    if (g_cutsceneGroundWaitMaxFrames < 0) g_cutsceneGroundWaitMaxFrames = 0;
+    if (g_cutsceneGroundWaitMaxFrames > 1800) g_cutsceneGroundWaitMaxFrames = 1800;
     if (g_controlLossThresholdFrames < 5) g_controlLossThresholdFrames = 5;
     if (g_controlLossThresholdFrames > 600) g_controlLossThresholdFrames = 600;
     g_vehicleExitModelReset = g_vehicleExitModelReset ? 1 : 0;
@@ -1926,6 +1942,7 @@ static void CompatScriptMain() {
     int scriptCamHandle = 0;
     int wasCutscenePlaying = 0;
     int cutsceneFixPendingFrames = 0;
+    int cutsceneGroundWaitFrames = 0;
     int controlOffFrames = 0;
     const char* softResetReason = "vehicle-exit";
     const char* rearmReason = "vehicle-exit";
@@ -2081,11 +2098,13 @@ static void CompatScriptMain() {
 
             if (!cutscenePlaying && wasCutscenePlaying && g_cutsceneHeadingFix) {
                 cutsceneFixPendingFrames = g_cutsceneEndSettleFrames > 0 ? g_cutsceneEndSettleFrames : 1;
+                cutsceneGroundWaitFrames = 0;
                 CLog("compat cutscene end detected, arming heading fix in %d frame(s)", cutsceneFixPendingFrames);
             } else if (cutscenePlaying && cutsceneFixPendingFrames > 0) {
                 // Another cutscene started before the settle window elapsed
                 // (e.g. back-to-back cutscenes) - abort, we'll re-arm when it ends.
                 cutsceneFixPendingFrames = 0;
+                cutsceneGroundWaitFrames = 0;
             }
             wasCutscenePlaying = cutscenePlaying ? 1 : 0;
 
@@ -2096,6 +2115,7 @@ static void CompatScriptMain() {
                     controlOffFrames >= g_controlLossThresholdFrames &&
                     cutsceneFixPendingFrames <= 0 && !cutscenePlaying && !dead && !arrested) {
                     cutsceneFixPendingFrames = g_cutsceneEndSettleFrames > 0 ? g_cutsceneEndSettleFrames : 1;
+                    cutsceneGroundWaitFrames = 0;
                     CLog("compat extended control-loss end detected (%d frames off), arming heading fix in %d frame(s)",
                          controlOffFrames, cutsceneFixPendingFrames);
                 }
@@ -2103,41 +2123,146 @@ static void CompatScriptMain() {
             }
 
             if (cutsceneFixPendingFrames > 0 && !cutscenePlaying) {
-                if (--cutsceneFixPendingFrames == 0 && ped != 0) {
-                    // Primary: RealVR's own HMD recenter, identical to the in-game
-                    // hotkey. Recalibrates the HMD-to-game-forward offset directly
-                    // through RealVR's own mechanism, independent of anything below.
-                    if (g_cutsceneRecenterFix) {
-                        TriggerRVRRecenter("cutscene-end");
+                // Some cutscenes (e.g. the one that ends with the player falling
+                // and having to navigate to the ground) hand control back while
+                // the player is still airborne. Applying the heading/camera fix
+                // mid-fall fights the landing, so wait for a safe, grounded state
+                // first - but cap the wait (CutsceneGroundWaitMaxFrames) so a
+                // misread air/ground/ragdoll flag can't stall the fix forever.
+                bool isPlayerInTheAir = NativeBool1(0x886E37EC497200B6ull, (uint64_t)(uint32_t)ped, true); // IS_PED_IN_AIR
+                bool isPlayerFalling = NativeBool1(0xFB92A102F1C4DFA3ull, (uint64_t)(uint32_t)ped, true); // IS_PED_FALLING
+                bool isPlayerRagdoll = NativeBool1(0x47E4E977581C5B55ull, (uint64_t)(uint32_t)ped, true); // IS_PED_RAGDOLL
+                bool isPlayerParachuting = NativeBool1(0x7DCE8BDA0F1C1200ull, (uint64_t)(uint32_t)ped, true); // IS_PED_PARACHUTE_FREE_FALLING
+                float heightAboveGround = NativeFloat1(0x1DD55701034110E5ull, (uint64_t)(uint32_t)ped, 0.0f); // GET_ENTITY_HEIGHT_ABOVE_GROUND
+                bool isGrounded = heightAboveGround < 0.5f;
+
+                bool safeToApply = !isPlayerInTheAir && isGrounded && !isPlayerFalling && !isPlayerRagdoll && !isPlayerParachuting;
+                bool groundWaitTimedOut = g_cutsceneGroundWaitMaxFrames > 0 && cutsceneGroundWaitFrames >= g_cutsceneGroundWaitMaxFrames;
+
+                if (!safeToApply && !groundWaitTimedOut) {
+                    if (cutsceneGroundWaitFrames == 0) {
+                        CLog("compat cutscene-end: waiting for grounded state before fix (inAir=%d falling=%d ragdoll=%d parachute=%d height=%.2f)",
+                             isPlayerInTheAir, isPlayerFalling, isPlayerRagdoll, isPlayerParachuting, heightAboveGround);
                     }
+                    ++cutsceneGroundWaitFrames;
+                } else {
+                    if (!safeToApply && groundWaitTimedOut) {
+                        CLog("compat cutscene-end: ground-wait timed out after %d frame(s), applying fix anyway", cutsceneGroundWaitFrames);
+                    }
+                    cutsceneGroundWaitFrames = 0;
 
-                    float camRot[3] = {0,0,0};
-                    bool rotOk = NativeVec3_1(0x837765A25378F0BBull, 2, camRot); // GET_GAMEPLAY_CAM_ROT(order=2)
-                    if (rotOk) {
-                        float pedHeadingBefore = NativeFloat1(0xE83D4F9BA2A38914ull, (uint64_t)(uint32_t)ped, 0.0f); // GET_ENTITY_HEADING
-                        NativeVoid2(0x8E2530AA8ADA980Eull, (uint64_t)(uint32_t)ped, FloatArg(camRot[2])); // SET_ENTITY_HEADING
-                        NativeVoid1(0xB4EC2312F4E5B1F1ull, FloatArg(0.0f)); // SET_GAMEPLAY_CAM_RELATIVE_HEADING(0)
-                        ReleaseGameplayCamClamps(0, "cutscene-end");
-                        CLog("compat cutscene-end heading fix: ped heading %.2f -> %.2f", pedHeadingBefore, camRot[2]);
+                    if (--cutsceneFixPendingFrames == 0 && ped != 0) {
+                        // Primary: RealVR's own HMD recenter, identical to the in-game
+                        // hotkey. Recalibrates the HMD-to-game-forward offset directly
+                        // through RealVR's own mechanism, independent of anything below.
+                        if (g_cutsceneRecenterFix) {
+                            TriggerRVRRecenter("cutscene-end");
+                        }
 
-                        if (g_cutsceneSoftReset && wantedFirstPerson) {
-                            if (softResetFrames > 0) {
-                                FinishSoftFirstPersonReset(softResetReason);
+                        float camRot[3] = {0,0,0};
+                        bool rotOk = NativeVec3_1(0x837765A25378F0BBull, 2, camRot); // GET_GAMEPLAY_CAM_ROT(order=2)
+                        if (rotOk) {
+                            float pedHeadingBefore = NativeFloat1(0xE83D4F9BA2A38914ull, (uint64_t)(uint32_t)ped, 0.0f); // GET_ENTITY_HEADING
+                            NativeVoid2(0x8E2530AA8ADA980Eull, (uint64_t)(uint32_t)ped, FloatArg(camRot[2])); // SET_ENTITY_HEADING
+                            NativeVoid1(0xB4EC2312F4E5B1F1ull, FloatArg(0.0f)); // SET_GAMEPLAY_CAM_RELATIVE_HEADING(0)
+                            ReleaseGameplayCamClamps(0, "cutscene-end");
+                            CLog("compat cutscene-end heading fix: ped heading %.2f -> %.2f", pedHeadingBefore, camRot[2]);
+
+                            // Optional model-reset fallback (mirrors VehicleExitModelReset):
+                            // forces RealVR's tracking to re-init via SET_PLAYER_MODEL. Off by
+                            // default and gated the same way as vehicle-exit - only meaningful
+                            // in first-person, only once control is back, and opt-in given the
+                            // known SET_PLAYER_MODEL side effects (see VehicleExitModelReset in
+                            // Technical.md: it can race mission scripts and needs the weapon/
+                            // wanted-level snapshot machinery InstantPlayerModelReset provides).
+                            if (g_cutsceneModelReset && wantedFirstPerson) {
+                                bool modelResetControlOn = !g_modelResetRequireControl ||
+                                    NativeBool1(0x49C32D60007AFA47ull, (uint64_t)(uint32_t)player, true); // IS_PLAYER_CONTROL_ON
+                                if (modelResetControlOn) {
+                                    // Unlike vehicle-exit, there's no "entry" moment to snapshot
+                                    // the model/appearance from here, so g_saved_player_model may
+                                    // be stale (left over from an earlier, unrelated vehicle ride)
+                                    // or never set. Refresh it from the ped's current state right
+                                    // before resetting so we don't restore the wrong outfit.
+                                    uint32_t freshModel = NativeInt1(0x9F47B058362C84B5ull, (uint64_t)(uint32_t)ped, 0); // ENTITY::GET_ENTITY_MODEL(ped)
+                                    if (freshModel != 0) {
+                                        g_saved_player_model = freshModel;
+                                        SaveCurrentAppearance(ped);
+                                    }
+                                    InstantPlayerModelReset("cutscene-end");
+                                    CLog("compat cutscene-end: model reset applied");
+                                } else {
+                                    CLog("compat cutscene-end: model reset SKIPPED (player control off)");
+                                }
                             }
-                            softResetFrames = g_firstPersonSoftResetFrames;
-                            softResetReason = "cutscene-end";
-                            BeginSoftFirstPersonReset("cutscene-end");
-                        }
-                        if (g_cutsceneScriptCamReset && wantedFirstPerson) {
-                            if (scriptCamFrames > 0 && scriptCamHandle) {
-                                FinishScriptCamReset(scriptCamHandle, "cutscene-end-replace");
-                                scriptCamHandle = 0; scriptCamFrames = 0;
+
+                            // CRITICAL: Full camera reinitialisation (3P -> 1P cycle), same
+                            // technique as vehicle-exit - forces the engine to re-init its
+                            // internal camera state.
+                            NativeVoid1(0x5A4F9EDF1673F704ull, 1); // third-person
+                            uint64_t ctx3P[2] = { 0, 1 };
+                            InvokeNativeRaw(0x2A2173E46DAECD12ull, ctx3P, 2, nullptr);
+
+                            NativeVoid1(0x5A4F9EDF1673F704ull, 4); // first-person
+                            uint64_t ctx1P[2] = { 0, 4 };
+                            InvokeNativeRaw(0x2A2173E46DAECD12ull, ctx1P, 2, nullptr);
+
+                            CLog("compat cutscene-end: camera reinit (3P->1P cycle)");
+
+                            // Activate 60-frame camera fix (same as vehicle-exit)
+                            camFixForceFrames = 60;
+                            CLog("compat cutscene-end: camera fix ACTIVATED (60 frames)");
+
+                            if (g_cutsceneSoftReset && wantedFirstPerson) {
+                                if (softResetFrames > 0) {
+                                    FinishSoftFirstPersonReset(softResetReason);
+                                }
+                                softResetFrames = g_firstPersonSoftResetFrames;
+                                softResetReason = "cutscene-end";
+                                BeginSoftFirstPersonReset("cutscene-end");
                             }
-                            BeginScriptCamReset(&scriptCamHandle, "cutscene-end");
-                            scriptCamFrames = scriptCamHandle ? g_scriptCamResetFrames : 0;
+                            if (g_cutsceneScriptCamReset && wantedFirstPerson) {
+                                if (scriptCamFrames > 0 && scriptCamHandle) {
+                                    FinishScriptCamReset(scriptCamHandle, "cutscene-end-replace");
+                                    scriptCamHandle = 0; scriptCamFrames = 0;
+                                }
+                                BeginScriptCamReset(&scriptCamHandle, "cutscene-end");
+                                scriptCamFrames = scriptCamHandle ? g_scriptCamResetFrames : 0;
+                            }
+
+                            // Full FP rearm / guard / unclamp pipeline, same as vehicle-exit
+                            if (wantedFirstPerson && g_firstPersonRearmFrames > 0) {
+                                rearmFrames = g_firstPersonRearmFrames;
+                                rearmFrameNo = 0;
+                                rearmReason = "cutscene-end";
+
+                                guardFrames = g_firstPersonGuardFrames;
+                                guardCooldown = g_firstPersonGuardInterval;
+                                guardPulseNo = 0;
+
+                                controlFixFrames = g_firstPersonControlFixFrames;
+                                controlFixFrameNo = 0;
+
+                                unclampFrames = g_firstPersonUnclampFrames;
+                                unclampFrameNo = 0;
+
+                                resetRearmCooldown = 0;
+
+                                CLog("compat cutscene-end: rearm armed frames=%d", rearmFrames);
+                                CLog("compat cutscene-end: guard armed frames=%d interval=%d pulse=%d",
+                                    guardFrames, g_firstPersonGuardInterval, g_firstPersonGuardPulseFrames);
+
+                                if (controlFixFrames > 0) {
+                                    CLog("compat cutscene-end: control fix armed frames=%d", controlFixFrames);
+                                }
+                                if (unclampFrames > 0) {
+                                    CLog("compat cutscene-end: unclamp armed frames=%d resetRearm=%d",
+                                        unclampFrames, g_firstPersonResetRearmFrames);
+                                }
+                            }
+                        } else {
+                            CLog("compat cutscene-end heading fix: GET_GAMEPLAY_CAM_ROT failed, skipped");
                         }
-                    } else {
-                        CLog("compat cutscene-end heading fix: GET_GAMEPLAY_CAM_ROT failed, skipped");
                     }
                 }
             }
@@ -3577,7 +3702,7 @@ static DWORD WINAPI CompatThread(void*) {
          (oldLogFn != 0 || logFnOk) ? "OK" : "FAIL");
 
     LoadPatchConfig();
-    CLog("patch config: FirstPersonJump=%d VehicleCamNop=%d CamPoolWriteNop=%d ForceFallback=%d CamPoolResolve=%d CamMetaOldOffset=%d RestoreCamMetadata=%d RestoreRVRState=%d ActiveEnginePatches=%d EnginePatchDelaySec=%d FirstPersonRearmFrames=%d FirstPersonGuardFrames=%d FirstPersonGuardPulseFrames=%d FirstPersonGuardInterval=%d FirstPersonFlagHold=%d FirstPersonControlFixFrames=%d FirstPersonUnclampFrames=%d FirstPersonResetRearmFrames=%d FirstPersonSoftReset=%d FirstPersonSoftResetFrames=%d KeepVehicleFirstPerson=%d RespawnGraceFrames=%d ScriptCamReset=%d ScriptCamResetFrames=%d VehicleExitModelReset=%d ModelResetRequireControl=%d ModelResetDeferMaxFrames=%d ModelResetPreserveWeapons=%d CutsceneHeadingFix=%d CutsceneSoftReset=%d CutsceneScriptCamReset=%d CutsceneEndSettleFrames=%d ControlLossHeadingFix=%d ControlLossThresholdFrames=%d CutsceneRecenterFix=%d VehicleExitRecenterFix=%d",
+    CLog("patch config: FirstPersonJump=%d VehicleCamNop=%d CamPoolWriteNop=%d ForceFallback=%d CamPoolResolve=%d CamMetaOldOffset=%d RestoreCamMetadata=%d RestoreRVRState=%d ActiveEnginePatches=%d EnginePatchDelaySec=%d FirstPersonRearmFrames=%d FirstPersonGuardFrames=%d FirstPersonGuardPulseFrames=%d FirstPersonGuardInterval=%d FirstPersonFlagHold=%d FirstPersonControlFixFrames=%d FirstPersonUnclampFrames=%d FirstPersonResetRearmFrames=%d FirstPersonSoftReset=%d FirstPersonSoftResetFrames=%d KeepVehicleFirstPerson=%d RespawnGraceFrames=%d ScriptCamReset=%d ScriptCamResetFrames=%d VehicleExitModelReset=%d ModelResetRequireControl=%d ModelResetDeferMaxFrames=%d ModelResetPreserveWeapons=%d CutsceneHeadingFix=%d CutsceneSoftReset=%d CutsceneScriptCamReset=%d CutsceneEndSettleFrames=%d CutsceneModelReset=%d CutsceneGroundWaitMaxFrames=%d ControlLossHeadingFix=%d ControlLossThresholdFrames=%d CutsceneRecenterFix=%d VehicleExitRecenterFix=%d",
          g_patchFirstPersonJump, g_patchVehicleCamNop, g_patchCamPoolWriteNop,
          g_patchForceFallback, g_patchCamPoolResolve, g_patchCamMetaOldOffset,
          g_patchRestoreCamMetadata, g_patchRestoreRVRState,
@@ -3589,7 +3714,8 @@ static DWORD WINAPI CompatThread(void*) {
          g_respawnGraceFrames, g_scriptCamReset, g_scriptCamResetFrames,
          g_vehicleExitModelReset, g_modelResetRequireControl, g_modelResetDeferMaxFrames,
          g_modelResetPreserveWeapons, g_cutsceneHeadingFix, g_cutsceneSoftReset, g_cutsceneScriptCamReset,
-         g_cutsceneEndSettleFrames, g_controlLossHeadingFix, g_controlLossThresholdFrames,
+         g_cutsceneEndSettleFrames, g_cutsceneModelReset, g_cutsceneGroundWaitMaxFrames,
+         g_controlLossHeadingFix, g_controlLossThresholdFrames,
          g_cutsceneRecenterFix, g_vehicleExitRecenterFix);
 
     NopIndirectCallsToRealVRSlot(realvr, 0x38018, "logFunction");
