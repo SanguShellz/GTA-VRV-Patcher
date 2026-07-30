@@ -263,13 +263,13 @@ static void LoadPatchConfig() {
     g_respawnGraceFrames = GetPrivateProfileIntA("patches", "RespawnGraceFrames", 300, iniPath);
     g_scriptCamReset = GetPrivateProfileIntA("patches", "ScriptCamReset", 0, iniPath);
     g_scriptCamResetFrames = GetPrivateProfileIntA("patches", "ScriptCamResetFrames", 2, iniPath);
-    g_vehicleExitModelReset = GetPrivateProfileIntA("patches", "VehicleExitModelReset", 0, iniPath);
+    g_vehicleExitModelReset = GetPrivateProfileIntA("patches", "VehicleExitModelReset", 1, iniPath);
     g_modelResetRequireControl = GetPrivateProfileIntA("patches", "ModelResetRequireControl", 1, iniPath);
     g_modelResetDeferMaxFrames = GetPrivateProfileIntA("patches", "ModelResetDeferMaxFrames", 300, iniPath);
     g_modelResetPreserveWeapons = GetPrivateProfileIntA("patches", "ModelResetPreserveWeapons", 1, iniPath);
     g_cutsceneHeadingFix = GetPrivateProfileIntA("patches", "CutsceneHeadingFix", 1, iniPath);
     g_cutsceneSoftReset = GetPrivateProfileIntA("patches", "CutsceneSoftReset", 1, iniPath);
-    g_cutsceneScriptCamReset = GetPrivateProfileIntA("patches", "CutsceneScriptCamReset", 0, iniPath);
+    g_cutsceneScriptCamReset = GetPrivateProfileIntA("patches", "CutsceneScriptCamReset", 1, iniPath);
     g_cutsceneEndSettleFrames = GetPrivateProfileIntA("patches", "CutsceneEndSettleFrames", 2, iniPath);
     g_controlLossHeadingFix = GetPrivateProfileIntA("patches", "ControlLossHeadingFix", 1, iniPath);
     g_controlLossThresholdFrames = GetPrivateProfileIntA("patches", "ControlLossThresholdFrames", 45, iniPath);
