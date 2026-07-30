@@ -74,11 +74,50 @@ static PropData g_saved_props[8];
 // Flag to restore appearance on next frame (allows animations to play first)
 static bool g_restore_appearance_next_frame = false;
 static int g_appearance_restore_ped = 0;
+// How to decide the pending restore is safe to apply:
+//   0 = RESTORE_ON_LANDING     - wait for IS_PED_FALLING to clear (vehicle exit:
+//                                 character is genuinely airborne/falling)
+//   1 = RESTORE_ON_DEATH_CLEAR - wait for the death flag to clear (a ragdolled
+//                                 corpse never reads as "falling", and applying
+//                                 the restore mid-death-sequence just gets
+//                                 discarded by GTA's own wasted->hospital flow)
+//   2 = RESTORE_ON_ARREST_CLEAR - same idea, for the busted/arrest flow
+static int g_restore_trigger_mode = 0;
+static const int RESTORE_ON_LANDING = 0;
+static const int RESTORE_ON_DEATH_CLEAR = 1;
+static const int RESTORE_ON_ARREST_CLEAR = 2;
 
 // Flag to trigger delayed model change (for autos with longer ejection animation)
 static bool g_pending_delayed_model_change = false;
 static int g_pending_delayed_model_change_frames = 0;
 static bool g_pending_delayed_is_motorcycle = false;
+
+// --- Weapon preservation around InstantPlayerModelReset() ---
+// SET_PLAYER_MODEL recreates the ped and resets it to the new model's default
+// loadout, which in practice means the player's weapons/ammo are wiped. The
+// original vehicle-exit fix never accounted for this. We snapshot the loadout
+// immediately before the model swap and re-give it back at the same point we
+// already restore appearance (once the falling animation finishes).
+struct SavedWeapon {
+    uint32_t hash;
+    int ammo;
+};
+static const int kMaxSavedWeapons = 64;
+static SavedWeapon g_saved_weapons[kMaxSavedWeapons];
+static int g_saved_weapon_count = 0;
+static uint32_t g_saved_selected_weapon = 0;
+static bool g_weapons_saved_valid = false;
+
+// --- Deferred / gated vehicle-exit model reset ---
+// The original code called InstantPlayerModelReset() unconditionally on every
+// vehicle exit. That races with mission scripts that move/teleport the player
+// on foot right after a vehicle drop-off (e.g. "deliver car" / "deliver bike"
+// missions), which is what causes the recreated ped to fall through the map.
+// We now require the player to actually have script control before we ever
+// touch the model, and we default the whole model-swap path to OFF in favor
+// of the non-destructive scriptCam/soft-reset fixes below.
+static bool g_pendingVehicleExitModelReset = false;
+static int g_pendingVehicleExitModelResetFrames = 0;
 
 // Saved velocity to apply to new ped after model change
 static float g_saved_velocity_x = 0.0f;
@@ -115,8 +154,76 @@ static int g_respawnGraceFrames = 300; // let GTA/RealVR rebuild camera after de
 // ScriptCamResetFrames frames, then destroys it. When GTA deactivates the
 // scripted cam and re-activates the gameplay cam, RealVR re-runs its
 // first-person camera init, restoring HMD head tracking after vehicle exit.
-static int g_scriptCamReset = 1;
+//
+// OFF by default: FirstPersonSoftReset below (cycling GTA's native
+// first/third-person ped cameras) does the same job with less risk of
+// interfering with anything else RealVR is tracking, since it never
+// presents a foreign camera type. An earlier theory that this was also
+// responsible for RealVR's "HeadingControl" feature getting stuck off after
+// vehicle exit was tested and falsified - disabling this alone didn't fix
+// HeadingControl. That issue is unrelated to ScriptCamReset and is still
+// open; see the RealVR-internal-state comment near GetRVRDataPtr/
+// TriggerRVRRecenter for the live memory address if you want to pick it
+// back up. Re-enable ScriptCamReset only if FirstPersonSoftReset alone
+// doesn't restore HMD rotation tracking for you.
+static int g_scriptCamReset = 0;
 static int g_scriptCamResetFrames = 2;
+
+// Less-aggressive vehicle-exit fix controls (see README "Model Reset Fallback").
+// VehicleExitModelReset: 0 = never recreate the player's ped on vehicle exit
+// (rely solely on ScriptCamReset/FirstPersonSoftReset above, which fix the
+// actual RealVR tracking flag without touching the ped). 1 = keep the old,
+// more forceful SET_PLAYER_MODEL-based fix available as an opt-in fallback.
+static int g_vehicleExitModelReset = 0;
+// Require PLAYER::IS_PLAYER_CONTROL_ON before InstantPlayerModelReset() is
+// allowed to run for a vehicle exit. When control is off (mission cutscene,
+// scripted hand-off/teleport such as a delivery mission), the reset is
+// deferred rather than firing immediately, so it can no longer race a
+// mission's own teleport and drop the recreated ped through the world.
+static int g_modelResetRequireControl = 1;
+// Maximum frames to wait for control to return before giving up on a
+// deferred vehicle-exit model reset (default ~5s at 60fps).
+static int g_modelResetDeferMaxFrames = 300;
+// Snapshot/restore the ped's weapons + ammo around any InstantPlayerModelReset
+// call (death, arrest, and the optional vehicle-exit fallback). Without this,
+// SET_PLAYER_MODEL silently strips the player's loadout.
+static int g_modelResetPreserveWeapons = 1;
+
+// Cutscene-end heading realignment. Some cutscenes hand control back with the
+// ped's body heading pointing a different way than the camera direction the
+// player ends up looking from (RealVR feeds HMD yaw into the gameplay cam
+// each frame, so the gameplay cam heading reflects where the player is
+// actually looking) - this shows up as the character being turned away from,
+// sometimes exactly opposite, the HMD view. On cutscene-end we snap the ped's
+// heading to match the camera and reset the relative-heading offset to 0.
+static int g_cutsceneHeadingFix = 1;
+// Also cycle GTA's native first/third-person ped cameras (same mechanism as
+// FirstPersonSoftReset) on cutscene end. Prefer this over CutsceneScriptCamReset
+// below for the same least-invasive reasoning as ScriptCamReset above.
+static int g_cutsceneSoftReset = 1;
+// Legacy/fallback scripted-camera re-init for cutscene end. OFF by default -
+// see the ScriptCamReset comment above.
+static int g_cutsceneScriptCamReset = 0;
+// Frames to wait after IS_CUTSCENE_PLAYING goes false before applying the fix,
+// giving GTA's own handoff (repositioning, animation blend-out) a moment to
+// settle first so we don't fight it mid-transition.
+static int g_cutsceneEndSettleFrames = 2;
+// Many in-mission "cutscenes" (dialogue hand-offs, scripted walk-and-talks)
+// never register with IS_CUTSCENE_PLAYING at all - they're just the mission
+// script disabling player control for a while. This treats an extended
+// control-off period the same as a cutscene for the heading fix, so those
+// get covered too. 0 disables this fallback detection.
+static int g_controlLossHeadingFix = 1;
+static int g_controlLossThresholdFrames = 45; // ~0.75s @60fps before we call it a "scripted sequence"
+
+// Trigger RealVR's own HMD recenter (TriggerRVRRecenter) on cutscene end /
+// extended control-loss end, in addition to the SET_ENTITY_HEADING-based
+// fix above. This recalibrates the HMD-to-game-forward offset directly
+// through RealVR's own mechanism rather than approximating it.
+static int g_cutsceneRecenterFix = 1;
+// Also trigger RealVR's own HMD recenter on vehicle exit. Off by default;
+// enable if HMD/character sync issues show up there too.
+static int g_vehicleExitRecenterFix = 0;
 static volatile LONG g_enginePatchesApplied = 0;
 
 using ScriptRegisterFn = void(*)(HMODULE, void(*)());
@@ -154,8 +261,35 @@ static void LoadPatchConfig() {
     g_firstPersonSoftResetFrames = GetPrivateProfileIntA("patches", "FirstPersonSoftResetFrames", 8, iniPath);
     g_keepVehicleFirstPerson = GetPrivateProfileIntA("patches", "KeepVehicleFirstPerson", 1, iniPath);
     g_respawnGraceFrames = GetPrivateProfileIntA("patches", "RespawnGraceFrames", 300, iniPath);
-    g_scriptCamReset = GetPrivateProfileIntA("patches", "ScriptCamReset", 1, iniPath);
+    g_scriptCamReset = GetPrivateProfileIntA("patches", "ScriptCamReset", 0, iniPath);
     g_scriptCamResetFrames = GetPrivateProfileIntA("patches", "ScriptCamResetFrames", 2, iniPath);
+    g_vehicleExitModelReset = GetPrivateProfileIntA("patches", "VehicleExitModelReset", 0, iniPath);
+    g_modelResetRequireControl = GetPrivateProfileIntA("patches", "ModelResetRequireControl", 1, iniPath);
+    g_modelResetDeferMaxFrames = GetPrivateProfileIntA("patches", "ModelResetDeferMaxFrames", 300, iniPath);
+    g_modelResetPreserveWeapons = GetPrivateProfileIntA("patches", "ModelResetPreserveWeapons", 1, iniPath);
+    g_cutsceneHeadingFix = GetPrivateProfileIntA("patches", "CutsceneHeadingFix", 1, iniPath);
+    g_cutsceneSoftReset = GetPrivateProfileIntA("patches", "CutsceneSoftReset", 1, iniPath);
+    g_cutsceneScriptCamReset = GetPrivateProfileIntA("patches", "CutsceneScriptCamReset", 0, iniPath);
+    g_cutsceneEndSettleFrames = GetPrivateProfileIntA("patches", "CutsceneEndSettleFrames", 2, iniPath);
+    g_controlLossHeadingFix = GetPrivateProfileIntA("patches", "ControlLossHeadingFix", 1, iniPath);
+    g_controlLossThresholdFrames = GetPrivateProfileIntA("patches", "ControlLossThresholdFrames", 45, iniPath);
+    g_cutsceneRecenterFix = GetPrivateProfileIntA("patches", "CutsceneRecenterFix", 1, iniPath);
+    g_vehicleExitRecenterFix = GetPrivateProfileIntA("patches", "VehicleExitRecenterFix", 0, iniPath);
+    g_cutsceneRecenterFix = g_cutsceneRecenterFix ? 1 : 0;
+    g_vehicleExitRecenterFix = g_vehicleExitRecenterFix ? 1 : 0;
+    g_cutsceneHeadingFix = g_cutsceneHeadingFix ? 1 : 0;
+    g_cutsceneSoftReset = g_cutsceneSoftReset ? 1 : 0;
+    g_cutsceneScriptCamReset = g_cutsceneScriptCamReset ? 1 : 0;
+    g_controlLossHeadingFix = g_controlLossHeadingFix ? 1 : 0;
+    if (g_cutsceneEndSettleFrames < 0) g_cutsceneEndSettleFrames = 0;
+    if (g_cutsceneEndSettleFrames > 60) g_cutsceneEndSettleFrames = 60;
+    if (g_controlLossThresholdFrames < 5) g_controlLossThresholdFrames = 5;
+    if (g_controlLossThresholdFrames > 600) g_controlLossThresholdFrames = 600;
+    g_vehicleExitModelReset = g_vehicleExitModelReset ? 1 : 0;
+    g_modelResetRequireControl = g_modelResetRequireControl ? 1 : 0;
+    g_modelResetPreserveWeapons = g_modelResetPreserveWeapons ? 1 : 0;
+    if (g_modelResetDeferMaxFrames < 0) g_modelResetDeferMaxFrames = 0;
+    if (g_modelResetDeferMaxFrames > 1800) g_modelResetDeferMaxFrames = 1800;
     if (g_scriptCamResetFrames < 1) g_scriptCamResetFrames = 1;
     if (g_scriptCamResetFrames > 30) g_scriptCamResetFrames = 30;
     if (g_enginePatchDelaySec < 0) g_enginePatchDelaySec = 0;
@@ -328,6 +462,57 @@ static bool WriteBytes(void* addr, const uint8_t* bytes, size_t size) {
     VirtualProtect(addr, size, old, &old);
     FlushInstructionCache(GetCurrentProcess(), addr, size);
     return true;
+}
+
+// ----------------------------------------------------------------------------
+// RealVR internal state (reverse-engineered from RealVR.asi's own hotkey
+// handler, not natives or approximated behavior). RealVR.asi registers a
+// single ScriptHookV keyboard callback that just timestamps key events into
+// a per-VK-code table; the actual hotkey ACTIONS live in the main per-frame
+// handler, which polls that table. Disassembling those checks gives the
+// exact memory location the NUMPAD "/" (Recenter HMD) hotkey reads/writes:
+//
+//   - g_RVRData+0x821 (byte): write 1 to request an HMD recenter. Confirmed
+//     as the exact byte the Recenter HMD hotkey's handler sets after its
+//     debounce check passes.
+//
+// This address was located by finding the keyboardHandlerRegister call in
+// the import table, disassembling the registered callback (which only
+// records raw key events), then locating the per-frame code that reads the
+// VK code's table slot and the state it touches next to it. g_RVRData
+// itself is the same pointer already resolved elsewhere in this file via
+// RealVR+0x38020.
+//
+// Note: the same method also located RealVR.asi_base+0x384F8, the live
+// HeadingControl value (0=always, 1=only aiming, 2=never) the "Y" hotkey
+// cycles through. A vehicle-exit fix built on that address didn't resolve
+// the reported HeadingControl issue and has been removed for now - the
+// address is left here as a starting point for revisiting it later.
+// ----------------------------------------------------------------------------
+static uint8_t* GetRVRDataPtr() {
+    if (!g_realvr) return nullptr;
+    uint8_t** slot = (uint8_t**)((uint8_t*)g_realvr + 0x38020);
+    __try {
+        return *slot;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+// Requests an HMD recenter - identical to pressing NUMPAD "/" in-game. This
+// recalibrates the offset between the HMD's physical orientation and the
+// in-game forward direction, which is exactly the kind of resync needed
+// after a cutscene (or anywhere else the two have drifted), without
+// touching the ped, camera object, or heading control setting at all.
+static bool TriggerRVRRecenter(const char* reason) {
+    uint8_t* rvrData = GetRVRDataPtr();
+    if (!rvrData) {
+        CLog("compat recenter: g_RVRData unavailable, skipped (reason=%s)", reason ? reason : "-");
+        return false;
+    }
+    bool ok = WriteU8(rvrData + 0x821, 1);
+    CLog("compat recenter: %s (reason=%s)", ok ? "requested" : "write failed", reason ? reason : "-");
+    return ok;
 }
 
 struct FileVersion {
@@ -664,10 +849,25 @@ static float NativeFloat0(uint64_t hash, float fallback = 0.0f) {
     return value;
 }
 
+static float NativeFloat1(uint64_t hash, uint64_t a, float fallback = 0.0f) {
+    uint64_t args[1] = { a };
+    uint64_t out = 0;
+    if (!InvokeNativeRaw(hash, args, 1, &out)) return fallback;
+    uint32_t bits = (uint32_t)out;
+    float value = fallback;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 static bool NativeBool2(uint64_t hash, uint64_t a, uint64_t b, bool fallback = false) {
     uint64_t args[2] = { a, b };
     uint64_t out = 0;
     return InvokeNativeRaw(hash, args, 2, &out) ? (out != 0) : fallback;
+}
+
+static bool NativeBool0(uint64_t hash, bool fallback = false) {
+    uint64_t out = 0;
+    return InvokeNativeRaw(hash, nullptr, 0, &out) ? (out != 0) : fallback;
 }
 
 static bool NativeBool1(uint64_t hash, uint64_t a, bool fallback = false) {
@@ -1176,6 +1376,137 @@ static void RestoreAppearance(int ped) {
     CLog("compat: restored appearance for ped 0x%X", ped);
 }
 
+// Common SP weapon hashes (joaat of the WEAPON_* names). SET_PLAYER_MODEL has
+// no "keep current loadout" flag, so the only reliable way to survive a model
+// swap with your guns intact is to snapshot HAS_PED_GOT_WEAPON/ammo for this
+// known set before the swap and GIVE_WEAPON_TO_PED them back afterward.
+static const uint32_t kKnownWeaponHashes[] = {
+    0x99B507EAu, // WEAPON_KNIFE
+    0x678B81B1u, // WEAPON_NIGHTSTICK
+    0x4E875F73u, // WEAPON_HAMMER
+    0x958A4A8Fu, // WEAPON_BAT
+    0x440E4788u, // WEAPON_GOLFCLUB
+    0x84BD7BFDu, // WEAPON_CROWBAR
+    0x1B06D571u, // WEAPON_PISTOL
+    0xBFE256D4u, // WEAPON_PISTOL_MK2
+    0x5EF9FEC4u, // WEAPON_COMBATPISTOL
+    0x22D8FE39u, // WEAPON_APPISTOL
+    0x3656C8C1u, // WEAPON_STUNGUN
+    0x99AEEB3Bu, // WEAPON_PISTOL50
+    0xBFD21232u, // WEAPON_SNSPISTOL
+    0x88374054u, // WEAPON_SNSPISTOL_MK2
+    0xD205520Eu, // WEAPON_HEAVYPISTOL
+    0x083839C4u, // WEAPON_VINTAGEPISTOL
+    0x47757124u, // WEAPON_FLAREGUN
+    0xDC4DB296u, // WEAPON_MARKSMANPISTOL
+    0xC1B3C3D1u, // WEAPON_REVOLVER
+    0xCB96392Fu, // WEAPON_REVOLVER_MK2
+    0x13532244u, // WEAPON_MICROSMG
+    0x2BE6766Bu, // WEAPON_SMG
+    0x78A97CD0u, // WEAPON_SMG_MK2
+    0xEFE7E2DFu, // WEAPON_ASSAULTSMG
+    0x0A3D4D34u, // WEAPON_COMBATPDW
+    0xDB1AA450u, // WEAPON_MACHINEPISTOL
+    0xBD248B55u, // WEAPON_MINISMG
+    0x1D073A89u, // WEAPON_PUMPSHOTGUN
+    0x555AF99Au, // WEAPON_PUMPSHOTGUN_MK2
+    0x7846A318u, // WEAPON_SAWNOFFSHOTGUN
+    0xE284C527u, // WEAPON_ASSAULTSHOTGUN
+    0x9D61E50Fu, // WEAPON_BULLPUPSHOTGUN
+    0xA89CB99Eu, // WEAPON_MUSKET
+    0x3AABBBAAu, // WEAPON_HEAVYSHOTGUN
+    0xEF951FBBu, // WEAPON_DBSHOTGUN
+    0x12E82D3Du, // WEAPON_AUTOSHOTGUN
+    0xBFEFFF6Du, // WEAPON_ASSAULTRIFLE
+    0x394F415Cu, // WEAPON_ASSAULTRIFLE_MK2
+    0x83BF0278u, // WEAPON_CARBINERIFLE
+    0xFAD1F1C9u, // WEAPON_CARBINERIFLE_MK2
+    0xAF113F99u, // WEAPON_ADVANCEDRIFLE
+    0xC0A3098Du, // WEAPON_SPECIALCARBINE
+    0x969C3D67u, // WEAPON_SPECIALCARBINE_MK2
+    0x7F229F94u, // WEAPON_BULLPUPRIFLE
+    0x84D6FAFDu, // WEAPON_BULLPUPRIFLE_MK2
+    0x624FE830u, // WEAPON_COMPACTRIFLE
+    0x9D07F764u, // WEAPON_MG
+    0x7FD62962u, // WEAPON_COMBATMG
+    0xDBBD7280u, // WEAPON_COMBATMG_MK2
+    0x61012683u, // WEAPON_GUSENBERG
+    0x05FC3C11u, // WEAPON_SNIPERRIFLE
+    0x0C472FE2u, // WEAPON_HEAVYSNIPER
+    0x0A914799u, // WEAPON_HEAVYSNIPER_MK2
+    0xC734385Au, // WEAPON_MARKSMANRIFLE
+    0x6A6C02E0u, // WEAPON_MARKSMANRIFLE_MK2
+    0xB1CA77B1u, // WEAPON_RPG
+    0xA284510Bu, // WEAPON_GRENADELAUNCHER
+    0x42BF8A85u, // WEAPON_MINIGUN
+    0x63AB0442u, // WEAPON_HOMINGLAUNCHER
+    0x93E220BDu, // WEAPON_GRENADE
+    0x2C3731D9u, // WEAPON_STICKYBOMB
+    0xAB564B93u, // WEAPON_PROXMINE
+    0xA0973D5Eu, // WEAPON_BZGAS
+    0x24B17070u, // WEAPON_MOLOTOV
+    0x060EC506u, // WEAPON_FIREEXTINGUISHER
+    0x34A67B97u, // WEAPON_PETROLCAN
+    0xFDBC8A50u, // WEAPON_SMOKEGRENADE
+    0xDD5DF8D9u, // WEAPON_MACHETE
+    0xF9DCBF2Du, // WEAPON_HATCHET
+    0xBA45E8B8u, // WEAPON_PIPEBOMB
+};
+static const int kKnownWeaponCount = sizeof(kKnownWeaponHashes) / sizeof(kKnownWeaponHashes[0]);
+
+// Snapshot the ped's current loadout (which weapons + how much ammo) before a
+// model swap. Must be called BEFORE SET_PLAYER_MODEL - the new ped starts
+// unarmed, so this is the last point the old loadout can still be read.
+static void SaveCurrentWeapons(int ped) {
+    g_saved_weapon_count = 0;
+    g_weapons_saved_valid = false;
+    for (int i = 0; i < kKnownWeaponCount && g_saved_weapon_count < kMaxSavedWeapons; ++i) {
+        uint64_t args[3] = { (uint64_t)(uint32_t)ped, (uint64_t)kKnownWeaponHashes[i], 0ull };
+        uint64_t out = 0;
+        bool ok = InvokeNativeRaw(0x8DECB02F88F428BCull, args, 3, &out); // HAS_PED_GOT_WEAPON
+        if (ok && out != 0) {
+            int ammo = NativeInt2(0x015A522136D7F951ull, (uint64_t)(uint32_t)ped,
+                                   (uint64_t)kKnownWeaponHashes[i], 0); // GET_AMMO_IN_PED_WEAPON
+            g_saved_weapons[g_saved_weapon_count].hash = kKnownWeaponHashes[i];
+            g_saved_weapons[g_saved_weapon_count].ammo = ammo;
+            g_saved_weapon_count++;
+        }
+    }
+    // GET_SELECTED_PED_WEAPON(ped) -> currently equipped weapon hash
+    uint64_t selArgs[1] = { (uint64_t)(uint32_t)ped };
+    uint64_t selOut = 0;
+    if (InvokeNativeRaw(0x0A6DB4965674D243ull, selArgs, 1, &selOut)) {
+        g_saved_selected_weapon = (uint32_t)selOut;
+    } else {
+        g_saved_selected_weapon = 0;
+    }
+    g_weapons_saved_valid = g_saved_weapon_count > 0;
+    CLog("compat: saved %d weapon(s) for ped 0x%X, selected=0x%X", g_saved_weapon_count, ped, g_saved_selected_weapon);
+}
+
+// Re-give the snapshot taken by SaveCurrentWeapons(). Safe to call even if
+// nothing was saved (no-op).
+static void RestoreWeapons(int ped) {
+    if (!g_weapons_saved_valid || g_saved_weapon_count <= 0) return;
+    for (int i = 0; i < g_saved_weapon_count; ++i) {
+        uint64_t args[5] = {
+            (uint64_t)(uint32_t)ped,
+            (uint64_t)g_saved_weapons[i].hash,
+            (uint64_t)(uint32_t)g_saved_weapons[i].ammo,
+            0ull, // isHidden
+            0ull  // equipNow (we set the selected weapon explicitly below)
+        };
+        InvokeNativeRaw(0xBF0FD6E56C964FCBull, args, 5, nullptr); // GIVE_WEAPON_TO_PED
+    }
+    if (g_saved_selected_weapon != 0) {
+        NativeVoid3(0xADF692B254977C0Cull, (uint64_t)(uint32_t)ped,
+                    (uint64_t)g_saved_selected_weapon, 1ull); // SET_CURRENT_PED_WEAPON(equipNow=true)
+    }
+    CLog("compat: restored %d weapon(s) for ped 0x%X, selected=0x%X", g_saved_weapon_count, ped, g_saved_selected_weapon);
+    g_weapons_saved_valid = false;
+    g_saved_weapon_count = 0;
+}
+
 static void InstantPlayerModelReset(const char* reason) {
     // Instant player model reset WITHOUT freeze: use saved model, request but don't wait for load
     // The model loads in background while gameplay continues naturally
@@ -1196,6 +1527,12 @@ static void InstantPlayerModelReset(const char* reason) {
 
             CLog("compat instant model reset: restoring saved model 0x%X reason=%s", modelToRestore, reason ? reason : "-");
 
+            // Snapshot weapons/ammo BEFORE the swap - SET_PLAYER_MODEL recreates
+            // the ped with the new model's default (usually empty) loadout.
+            if (g_modelResetPreserveWeapons) {
+                SaveCurrentWeapons(ped);
+            }
+
             // REQUEST_MODEL - just request, DON'T WAIT for load
             // KEY: Removing the wait loop is what eliminates the freeze!
             // The model will load in background while player continues falling/jumping/etc
@@ -1209,10 +1546,23 @@ static void InstantPlayerModelReset(const char* reason) {
             // Get the new ped after model change
             int newPed = NativeInt0(0xD80958FC74E988A6ull, 0); // PLAYER::PLAYER_PED_ID()
 
-            // Mark to restore appearance on next frame
+            // Mark to restore appearance/weapons once it's safe to do so. What
+            // "safe" means depends on why we're here: after a vehicle exit the
+            // character is genuinely airborne, so wait for IS_PED_FALLING to
+            // clear; after death/arrest the ped is ragdolled (never reads as
+            // "falling") and the real hand-off doesn't complete until GTA's own
+            // wasted/busted -> hospital/station flow finishes, so wait for that
+            // flag to clear instead.
             if (newPed != 0) {
                 g_appearance_restore_ped = newPed;
                 g_restore_appearance_next_frame = true;
+                if (reason && strstr(reason, "death")) {
+                    g_restore_trigger_mode = RESTORE_ON_DEATH_CLEAR;
+                } else if (reason && strstr(reason, "arrest")) {
+                    g_restore_trigger_mode = RESTORE_ON_ARREST_CLEAR;
+                } else {
+                    g_restore_trigger_mode = RESTORE_ON_LANDING;
+                }
             }
 
             // Release model from script ownership (it will load asynchronously in background)
@@ -1461,7 +1811,7 @@ static void BeginScriptCamReset(int* outHandle, const char* reason) {
     }
 
     // Explicitly activate the camera (required before RenderScriptCams)
-    NativeVoid1(0x757E89CD529E4B49ull, (uint64_t)(uint32_t)cam); // SET_CAM_ACTIVE(cam, true)
+    NativeVoid1(0x026FB97D0A425F84ull, (uint64_t)(uint32_t)cam); // SET_CAM_ACTIVE(cam, true)
     CLog("scriptCam reset: SET_CAM_ACTIVE cam=%d", cam);
 
     // Switch to script cam instantly (no ease, no transition time) → gameplay cam goes dark
@@ -1530,6 +1880,10 @@ static void CompatScriptMain() {
     int respawnGraceFrames = 0;
     int scriptCamFrames = 0;
     int scriptCamHandle = 0;
+    int wasCutscenePlaying = 0;
+    int cutsceneFixPendingFrames = 0;
+    int controlOffFrames = 0;
+    const char* softResetReason = "vehicle-exit";
     const char* rearmReason = "vehicle-exit";
     int camFixForceFrames = 0;  // Force camera reset for 60 frames after vehicle exit
 
@@ -1548,16 +1902,38 @@ static void CompatScriptMain() {
             // Check if player is being arrested (busted screen showing)
             bool arrested = NativeBool2(0x388A47C51ABDAC8Eull, (uint64_t)(uint32_t)player, 0, false); // IS_PLAYER_BEING_ARRESTED
 
-            // Restore appearance ONLY when falling animation is complete (ped is standing)
+            // Restore appearance/weapons once it's safe - see RESTORE_ON_* comments
+            // above for why the readiness check differs by trigger mode.
             if (g_restore_appearance_next_frame && g_appearance_restore_ped != 0) {
-                bool isFalling = NativeBool1(0xFB92A102F1C4DFA3ull, (uint64_t)(uint32_t)g_appearance_restore_ped, true); // IS_PED_FALLING
+                bool readyToRestore = false;
+                if (g_restore_trigger_mode == RESTORE_ON_DEATH_CLEAR) {
+                    readyToRestore = !dead;
+                } else if (g_restore_trigger_mode == RESTORE_ON_ARREST_CLEAR) {
+                    readyToRestore = !arrested;
+                } else {
+                    bool isFalling = NativeBool1(0xFB92A102F1C4DFA3ull, (uint64_t)(uint32_t)g_appearance_restore_ped, true); // IS_PED_FALLING
+                    readyToRestore = !isFalling;
+                }
 
-                // Only restore when NOT falling and some frames have passed
-                if (!isFalling) {
-                    RestoreAppearance(g_appearance_restore_ped);
+                if (readyToRestore) {
+                    // The death/arrest -> respawn gap can span several seconds, during
+                    // which GTA's own hand-off may have moved on to a fresh ped handle;
+                    // re-resolve it now rather than trust the one captured back when the
+                    // reset first armed.
+                    int restorePed = g_appearance_restore_ped;
+                    int triggerModeForLog = g_restore_trigger_mode;
+                    if (g_restore_trigger_mode != RESTORE_ON_LANDING) {
+                        int freshPed = NativeInt0(0xD80958FC74E988A6ull, 0); // PLAYER::PLAYER_PED_ID()
+                        if (freshPed != 0) restorePed = freshPed;
+                    }
+                    RestoreAppearance(restorePed);
+                    if (g_modelResetPreserveWeapons) {
+                        RestoreWeapons(restorePed);
+                    }
                     g_restore_appearance_next_frame = false;
                     g_appearance_restore_ped = 0;
-                    CLog("compat: appearance restored after falling animation complete");
+                    g_restore_trigger_mode = RESTORE_ON_LANDING;
+                    CLog("compat: appearance/weapons restored for ped 0x%X (trigger=%d)", restorePed, triggerModeForLog);
                 }
             }
 
@@ -1572,22 +1948,25 @@ static void CompatScriptMain() {
                 resetRearmCooldown = 0;
                 fpStateLogCooldown = 0;
 
-                // INSTANT MODEL RESET: Change ped immediately when dead to restore camera
-                InstantPlayerModelReset("death-detected");
-                CLog("compat death detected - instant model reset applied");
-
-                // CRITICAL: Clean up vehicle/model state when dead
-                // Prevents stale appearance restoration or model changes from interfering after respawn
+                // CRITICAL: Clean up any STALE pending restore state (e.g. a
+                // vehicle-exit restore that never got to finish) BEFORE arming
+                // the death reset below - InstantPlayerModelReset() sets
+                // g_appearance_restore_ped/g_restore_appearance_next_frame for
+                // ITS OWN restore, and clearing these AFTER the call (as this
+                // used to do) wiped out that fresh state immediately, so
+                // weapons/appearance were snapshotted but never actually
+                // restored after a hospital respawn.
                 g_saved_player_model = 0;
                 g_appearance_restore_ped = 0;
                 g_restore_appearance_next_frame = false;
                 g_pending_delayed_model_change = false;
                 g_pending_delayed_model_change_frames = 0;
-
-                // CRITICAL: Reset RealVR state (especially important for helicopter/airplane deaths)
-                // This prevents stale RealVR camera state from breaking controls after respawn
                 g_savedRVRStateValid = false;
                 g_savedCamMetadataPool = 0;
+
+                // INSTANT MODEL RESET: Change ped immediately when dead to restore camera
+                InstantPlayerModelReset("death-detected");
+                CLog("compat death detected - instant model reset applied");
 
                 CLog("compat death detected pedView=%d vehView=%d, camera forcing paused, ALL state cleaned", pedView, vehView);
             } else if (!dead && wasDead) {
@@ -1598,11 +1977,10 @@ static void CompatScriptMain() {
             wasDead = dead ? 1 : 0;
 
             if (arrested && !wasArrested) {
-                // INSTANT MODEL RESET: Change ped immediately when arrested to restore camera
-                InstantPlayerModelReset("arrest-detected");
-                CLog("compat arrest detected - instant model reset applied");
-
-                // Clean up state similar to death
+                // Clean up any STALE pending restore state BEFORE arming the
+                // arrest reset below - see the death-detected block above for
+                // why this ordering matters (this used to run after the call
+                // and discarded its own fresh restore flag).
                 g_saved_player_model = 0;
                 g_appearance_restore_ped = 0;
                 g_restore_appearance_next_frame = false;
@@ -1610,8 +1988,112 @@ static void CompatScriptMain() {
                 g_pending_delayed_model_change_frames = 0;
                 g_savedRVRStateValid = false;
                 g_savedCamMetadataPool = 0;
+
+                // INSTANT MODEL RESET: Change ped immediately when arrested to restore camera
+                InstantPlayerModelReset("arrest-detected");
+                CLog("compat arrest detected - instant model reset applied");
             }
             wasArrested = arrested ? 1 : 0;
+
+            // Service a deferred vehicle-exit model reset (see VehicleExitModelReset
+            // above): fire it the first frame script control returns, abort if the
+            // player gets back into a vehicle first, or give up after the configured
+            // timeout so we never wait forever on a stuck flag.
+            if (g_pendingVehicleExitModelReset) {
+                if (inVeh) {
+                    g_pendingVehicleExitModelReset = false;
+                    CLog("compat deferred vehicle-exit model reset ABORTED (re-entered vehicle)");
+                } else {
+                    bool controlOn = NativeBool1(0x49C32D60007AFA47ull, (uint64_t)(uint32_t)player, true); // IS_PLAYER_CONTROL_ON
+                    if (controlOn) {
+                        InstantPlayerModelReset("vehicle-exit-deferred");
+                        g_pendingVehicleExitModelReset = false;
+                        CLog("compat deferred vehicle-exit model reset FIRED (control restored)");
+                    } else if (--g_pendingVehicleExitModelResetFrames <= 0) {
+                        g_pendingVehicleExitModelReset = false;
+                        CLog("compat deferred vehicle-exit model reset TIMED OUT waiting for player control");
+                    }
+                }
+            }
+
+            // Cutscene-end heading realignment: some cutscenes hand control back
+            // with the ped's body heading pointing a different way than the
+            // camera - since RealVR feeds HMD yaw into the gameplay cam heading
+            // each frame, that mismatch shows up as the character being turned
+            // away from (sometimes exactly opposite) the direction you're
+            // actually looking. Wait a short settle window after the cutscene
+            // ends, then snap the ped's heading to the camera's and reset the
+            // relative-heading offset.
+            //
+            // Many in-mission "cutscenes" are just the mission script disabling
+            // player control for a scripted moment and never register with
+            // IS_CUTSCENE_PLAYING at all, so we also treat an extended
+            // control-off period the same way (ControlLossHeadingFix).
+            bool cutscenePlaying = NativeBool0(0xD3C2E180A40F031Eull, false); // IS_CUTSCENE_PLAYING
+            bool controlOnNow = player >= 0 && NativeBool1(0x49C32D60007AFA47ull, (uint64_t)(uint32_t)player, true); // IS_PLAYER_CONTROL_ON
+
+            if (!cutscenePlaying && wasCutscenePlaying && g_cutsceneHeadingFix) {
+                cutsceneFixPendingFrames = g_cutsceneEndSettleFrames > 0 ? g_cutsceneEndSettleFrames : 1;
+                CLog("compat cutscene end detected, arming heading fix in %d frame(s)", cutsceneFixPendingFrames);
+            } else if (cutscenePlaying && cutsceneFixPendingFrames > 0) {
+                // Another cutscene started before the settle window elapsed
+                // (e.g. back-to-back cutscenes) - abort, we'll re-arm when it ends.
+                cutsceneFixPendingFrames = 0;
+            }
+            wasCutscenePlaying = cutscenePlaying ? 1 : 0;
+
+            if (!controlOnNow && !dead && !arrested) {
+                if (controlOffFrames < 100000) ++controlOffFrames;
+            } else {
+                if (g_controlLossHeadingFix && g_cutsceneHeadingFix &&
+                    controlOffFrames >= g_controlLossThresholdFrames &&
+                    cutsceneFixPendingFrames <= 0 && !cutscenePlaying && !dead && !arrested) {
+                    cutsceneFixPendingFrames = g_cutsceneEndSettleFrames > 0 ? g_cutsceneEndSettleFrames : 1;
+                    CLog("compat extended control-loss end detected (%d frames off), arming heading fix in %d frame(s)",
+                         controlOffFrames, cutsceneFixPendingFrames);
+                }
+                controlOffFrames = 0;
+            }
+
+            if (cutsceneFixPendingFrames > 0 && !cutscenePlaying) {
+                if (--cutsceneFixPendingFrames == 0 && ped != 0) {
+                    // Primary: RealVR's own HMD recenter, identical to the in-game
+                    // hotkey. Recalibrates the HMD-to-game-forward offset directly
+                    // through RealVR's own mechanism, independent of anything below.
+                    if (g_cutsceneRecenterFix) {
+                        TriggerRVRRecenter("cutscene-end");
+                    }
+
+                    float camRot[3] = {0,0,0};
+                    bool rotOk = NativeVec3_1(0x837765A25378F0BBull, 2, camRot); // GET_GAMEPLAY_CAM_ROT(order=2)
+                    if (rotOk) {
+                        float pedHeadingBefore = NativeFloat1(0xE83D4F9BA2A38914ull, (uint64_t)(uint32_t)ped, 0.0f); // GET_ENTITY_HEADING
+                        NativeVoid2(0x8E2530AA8ADA980Eull, (uint64_t)(uint32_t)ped, FloatArg(camRot[2])); // SET_ENTITY_HEADING
+                        NativeVoid1(0xB4EC2312F4E5B1F1ull, FloatArg(0.0f)); // SET_GAMEPLAY_CAM_RELATIVE_HEADING(0)
+                        ReleaseGameplayCamClamps(0, "cutscene-end");
+                        CLog("compat cutscene-end heading fix: ped heading %.2f -> %.2f", pedHeadingBefore, camRot[2]);
+
+                        if (g_cutsceneSoftReset && wantedFirstPerson) {
+                            if (softResetFrames > 0) {
+                                FinishSoftFirstPersonReset(softResetReason);
+                            }
+                            softResetFrames = g_firstPersonSoftResetFrames;
+                            softResetReason = "cutscene-end";
+                            BeginSoftFirstPersonReset("cutscene-end");
+                        }
+                        if (g_cutsceneScriptCamReset && wantedFirstPerson) {
+                            if (scriptCamFrames > 0 && scriptCamHandle) {
+                                FinishScriptCamReset(scriptCamHandle, "cutscene-end-replace");
+                                scriptCamHandle = 0; scriptCamFrames = 0;
+                            }
+                            BeginScriptCamReset(&scriptCamHandle, "cutscene-end");
+                            scriptCamFrames = scriptCamHandle ? g_scriptCamResetFrames : 0;
+                        }
+                    } else {
+                        CLog("compat cutscene-end heading fix: GET_GAMEPLAY_CAM_ROT failed, skipped");
+                    }
+                }
+            }
 
             bool cameraGrace = dead || respawnGraceFrames > 0;
 
@@ -1665,10 +2147,31 @@ static void CompatScriptMain() {
                 CLog("compat vehicle exit detected pedView=%d vehView=%d wantedFP=%d", pedView, vehView, wantedFirstPerson);
                 LogCompatFirstPersonState("vehicle-exit", 0, pedView, vehView);
 
-                // INSTANT MODEL RESET: Always change model immediately when exiting vehicle
-                // This preserves velocity and allows falling animation to continue
-                InstantPlayerModelReset("vehicle-exit");
-                CLog("compat vehicle exit: model reset applied immediately");
+                // MODEL RESET (opt-in fallback, OFF by default - see VehicleExitModelReset):
+                // Recreating the ped via SET_PLAYER_MODEL reliably restores HMD tracking,
+                // but it also (a) strips weapons unless we snapshot/restore them and
+                // (b) can race a mission script that is simultaneously moving/teleporting
+                // the player right after a vehicle drop-off, which is what was dropping
+                // players through the map after missions like the stolen-car delivery and
+                // the motorcycle repo job. We only ever fire it when the player was
+                // actually in first-person (nothing to fix otherwise) and, unless
+                // explicitly disabled, only once the player has script control back
+                // (i.e. not mid-cutscene/mid-teleport) - deferring rather than skipping
+                // if control is currently off.
+                if (g_vehicleExitModelReset && wantedFirstPerson) {
+                    bool controlOn = !g_modelResetRequireControl ||
+                                      NativeBool1(0x49C32D60007AFA47ull, (uint64_t)(uint32_t)player, true); // IS_PLAYER_CONTROL_ON
+                    if (controlOn) {
+                        InstantPlayerModelReset("vehicle-exit");
+                        CLog("compat vehicle exit: model reset applied immediately");
+                    } else {
+                        g_pendingVehicleExitModelReset = true;
+                        g_pendingVehicleExitModelResetFrames = g_modelResetDeferMaxFrames;
+                        CLog("compat vehicle exit: model reset DEFERRED (player control off - likely mission cutscene/teleport)");
+                    }
+                } else if (!g_vehicleExitModelReset) {
+                    CLog("compat vehicle exit: model reset SKIPPED (VehicleExitModelReset=0, using scriptCam/soft-reset only)");
+                }
 
                 // Activate camera fix for 60 frames (force FP + reset heading/pitch)
                 camFixForceFrames = 60;
@@ -1706,8 +2209,12 @@ static void CompatScriptMain() {
                 }
                 if (wantedFirstPerson && g_firstPersonSoftReset) {
                     softResetFrames = g_firstPersonSoftResetFrames;
+                    softResetReason = "vehicle-exit";
                     BeginSoftFirstPersonReset("vehicle-exit");
                     CLog("compat first-person soft reset armed frames=%d", softResetFrames);
+                }
+                if (wantedFirstPerson && g_vehicleExitRecenterFix) {
+                    TriggerRVRRecenter("vehicle-exit");
                 }
                 if (wantedFirstPerson && g_firstPersonRearmFrames > 0) {
                     rearmFrames = g_firstPersonRearmFrames;
@@ -1781,7 +2288,7 @@ static void CompatScriptMain() {
             if (!cameraGrace && !inVeh && softResetFrames > 0) {
                 --softResetFrames;
                 if (softResetFrames == 0) {
-                    FinishSoftFirstPersonReset("vehicle-exit");
+                    FinishSoftFirstPersonReset(softResetReason);
                     LogCompatFirstPersonState("soft-reset-finish", 0, pedView, vehView);
                 }
             }
@@ -3023,7 +3530,7 @@ static DWORD WINAPI CompatThread(void*) {
          (oldLogFn != 0 || logFnOk) ? "OK" : "FAIL");
 
     LoadPatchConfig();
-    CLog("patch config: FirstPersonJump=%d VehicleCamNop=%d CamPoolWriteNop=%d ForceFallback=%d CamPoolResolve=%d CamMetaOldOffset=%d RestoreCamMetadata=%d RestoreRVRState=%d ActiveEnginePatches=%d EnginePatchDelaySec=%d FirstPersonRearmFrames=%d FirstPersonGuardFrames=%d FirstPersonGuardPulseFrames=%d FirstPersonGuardInterval=%d FirstPersonFlagHold=%d FirstPersonControlFixFrames=%d FirstPersonUnclampFrames=%d FirstPersonResetRearmFrames=%d FirstPersonSoftReset=%d FirstPersonSoftResetFrames=%d KeepVehicleFirstPerson=%d RespawnGraceFrames=%d ScriptCamReset=%d ScriptCamResetFrames=%d",
+    CLog("patch config: FirstPersonJump=%d VehicleCamNop=%d CamPoolWriteNop=%d ForceFallback=%d CamPoolResolve=%d CamMetaOldOffset=%d RestoreCamMetadata=%d RestoreRVRState=%d ActiveEnginePatches=%d EnginePatchDelaySec=%d FirstPersonRearmFrames=%d FirstPersonGuardFrames=%d FirstPersonGuardPulseFrames=%d FirstPersonGuardInterval=%d FirstPersonFlagHold=%d FirstPersonControlFixFrames=%d FirstPersonUnclampFrames=%d FirstPersonResetRearmFrames=%d FirstPersonSoftReset=%d FirstPersonSoftResetFrames=%d KeepVehicleFirstPerson=%d RespawnGraceFrames=%d ScriptCamReset=%d ScriptCamResetFrames=%d VehicleExitModelReset=%d ModelResetRequireControl=%d ModelResetDeferMaxFrames=%d ModelResetPreserveWeapons=%d CutsceneHeadingFix=%d CutsceneSoftReset=%d CutsceneScriptCamReset=%d CutsceneEndSettleFrames=%d ControlLossHeadingFix=%d ControlLossThresholdFrames=%d CutsceneRecenterFix=%d VehicleExitRecenterFix=%d",
          g_patchFirstPersonJump, g_patchVehicleCamNop, g_patchCamPoolWriteNop,
          g_patchForceFallback, g_patchCamPoolResolve, g_patchCamMetaOldOffset,
          g_patchRestoreCamMetadata, g_patchRestoreRVRState,
@@ -3032,7 +3539,11 @@ static DWORD WINAPI CompatThread(void*) {
          g_firstPersonFlagHold, g_firstPersonControlFixFrames,
          g_firstPersonUnclampFrames, g_firstPersonResetRearmFrames,
          g_firstPersonSoftReset, g_firstPersonSoftResetFrames, g_keepVehicleFirstPerson,
-         g_respawnGraceFrames, g_scriptCamReset, g_scriptCamResetFrames);
+         g_respawnGraceFrames, g_scriptCamReset, g_scriptCamResetFrames,
+         g_vehicleExitModelReset, g_modelResetRequireControl, g_modelResetDeferMaxFrames,
+         g_modelResetPreserveWeapons, g_cutsceneHeadingFix, g_cutsceneSoftReset, g_cutsceneScriptCamReset,
+         g_cutsceneEndSettleFrames, g_controlLossHeadingFix, g_controlLossThresholdFrames,
+         g_cutsceneRecenterFix, g_vehicleExitRecenterFix);
 
     NopIndirectCallsToRealVRSlot(realvr, 0x38018, "logFunction");
     PatchCamMetadataResolverVersionOffset(realvr);

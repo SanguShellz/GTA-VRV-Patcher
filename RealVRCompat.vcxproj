@@ -45,7 +45,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\Compat\RealVRCompat.cpp"/>
+    <ClCompile Include="src\RealVRCompat.cpp"/>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets"/>
 </Project>
