@@ -108,6 +108,15 @@ static int g_saved_weapon_count = 0;
 static uint32_t g_saved_selected_weapon = 0;
 static bool g_weapons_saved_valid = false;
 
+// --- Wanted-level preservation around InstantPlayerModelReset() ---
+// Same root cause as the weapon wipe above: SET_PLAYER_MODEL recreates the
+// ped, and the fresh CPed the game hands back starts with no wanted level,
+// which reads to the player as their stars vanishing on vehicle exit (or
+// after the death/arrest model reset). Snapshot it immediately before the
+// swap and re-apply it at the same point weapons/appearance get restored.
+static int g_saved_wanted_level = 0;
+static bool g_wanted_level_saved_valid = false;
+
 // --- Deferred / gated vehicle-exit model reset ---
 // The original code called InstantPlayerModelReset() unconditionally on every
 // vehicle exit. That races with mission scripts that move/teleport the player
@@ -188,6 +197,10 @@ static int g_modelResetDeferMaxFrames = 300;
 // call (death, arrest, and the optional vehicle-exit fallback). Without this,
 // SET_PLAYER_MODEL silently strips the player's loadout.
 static int g_modelResetPreserveWeapons = 1;
+// Same idea for the player's wanted level (police stars) - SET_PLAYER_MODEL's
+// fresh ped comes back with wanted level cleared. Without this, stars vanish
+// on vehicle exit whenever VehicleExitModelReset=1 is active.
+static int g_modelResetPreserveWantedLevel = 1;
 
 // Cutscene-end heading realignment. Some cutscenes hand control back with the
 // ped's body heading pointing a different way than the camera direction the
@@ -267,6 +280,7 @@ static void LoadPatchConfig() {
     g_modelResetRequireControl = GetPrivateProfileIntA("patches", "ModelResetRequireControl", 1, iniPath);
     g_modelResetDeferMaxFrames = GetPrivateProfileIntA("patches", "ModelResetDeferMaxFrames", 300, iniPath);
     g_modelResetPreserveWeapons = GetPrivateProfileIntA("patches", "ModelResetPreserveWeapons", 1, iniPath);
+    g_modelResetPreserveWantedLevel = GetPrivateProfileIntA("patches", "ModelResetPreserveWantedLevel", 1, iniPath);
     g_cutsceneHeadingFix = GetPrivateProfileIntA("patches", "CutsceneHeadingFix", 1, iniPath);
     g_cutsceneSoftReset = GetPrivateProfileIntA("patches", "CutsceneSoftReset", 1, iniPath);
     g_cutsceneScriptCamReset = GetPrivateProfileIntA("patches", "CutsceneScriptCamReset", 1, iniPath);
@@ -288,6 +302,7 @@ static void LoadPatchConfig() {
     g_vehicleExitModelReset = g_vehicleExitModelReset ? 1 : 0;
     g_modelResetRequireControl = g_modelResetRequireControl ? 1 : 0;
     g_modelResetPreserveWeapons = g_modelResetPreserveWeapons ? 1 : 0;
+    g_modelResetPreserveWantedLevel = g_modelResetPreserveWantedLevel ? 1 : 0;
     if (g_modelResetDeferMaxFrames < 0) g_modelResetDeferMaxFrames = 0;
     if (g_modelResetDeferMaxFrames > 1800) g_modelResetDeferMaxFrames = 1800;
     if (g_scriptCamResetFrames < 1) g_scriptCamResetFrames = 1;
@@ -1507,6 +1522,30 @@ static void RestoreWeapons(int ped) {
     g_saved_weapon_count = 0;
 }
 
+// Snapshot the player's current wanted level before a model swap. Must be
+// called BEFORE SET_PLAYER_MODEL, same timing constraint as SaveCurrentWeapons -
+// takes a Player id, not a Ped handle (wanted level lives on the player, not
+// the ped, but the fresh ped from the swap still comes back clean).
+static void SaveCurrentWantedLevel(int player) {
+    g_saved_wanted_level = NativeInt1(0xE28E54788CE8F12Dull, (uint64_t)(uint32_t)player, 0); // PLAYER::GET_PLAYER_WANTED_LEVEL
+    g_wanted_level_saved_valid = true;
+    CLog("compat: saved wanted level %d for player 0x%X", g_saved_wanted_level, player);
+}
+
+// Re-apply the snapshot taken by SaveCurrentWantedLevel(). Safe to call even
+// if nothing was saved, or if the saved level was 0 (no-op either way).
+static void RestoreWantedLevel(int player) {
+    if (!g_wanted_level_saved_valid) return;
+    if (g_saved_wanted_level > 0) {
+        NativeVoid3(0x39FF19C64EF7DA5Bull, (uint64_t)(uint32_t)player,
+                    (uint64_t)(uint32_t)g_saved_wanted_level, 0ull); // PLAYER::SET_PLAYER_WANTED_LEVEL
+        NativeVoid2(0xE0A7D1E497FFCD6Full, (uint64_t)(uint32_t)player, 0ull); // PLAYER::SET_PLAYER_WANTED_LEVEL_NOW
+    }
+    CLog("compat: restored wanted level %d for player 0x%X", g_saved_wanted_level, player);
+    g_wanted_level_saved_valid = false;
+    g_saved_wanted_level = 0;
+}
+
 static void InstantPlayerModelReset(const char* reason) {
     // Instant player model reset WITHOUT freeze: use saved model, request but don't wait for load
     // The model loads in background while gameplay continues naturally
@@ -1531,6 +1570,11 @@ static void InstantPlayerModelReset(const char* reason) {
             // the ped with the new model's default (usually empty) loadout.
             if (g_modelResetPreserveWeapons) {
                 SaveCurrentWeapons(ped);
+            }
+            // Same for wanted level - the recreated ped comes back with the
+            // player's stars cleared unless we snapshot and re-apply them too.
+            if (g_modelResetPreserveWantedLevel) {
+                SaveCurrentWantedLevel(playerId);
             }
 
             // REQUEST_MODEL - just request, DON'T WAIT for load
@@ -1930,10 +1974,13 @@ static void CompatScriptMain() {
                     if (g_modelResetPreserveWeapons) {
                         RestoreWeapons(restorePed);
                     }
+                    if (g_modelResetPreserveWantedLevel) {
+                        RestoreWantedLevel(player);
+                    }
                     g_restore_appearance_next_frame = false;
                     g_appearance_restore_ped = 0;
                     g_restore_trigger_mode = RESTORE_ON_LANDING;
-                    CLog("compat: appearance/weapons restored for ped 0x%X (trigger=%d)", restorePed, triggerModeForLog);
+                    CLog("compat: appearance/weapons/wanted-level restored for ped 0x%X (trigger=%d)", restorePed, triggerModeForLog);
                 }
             }
 
