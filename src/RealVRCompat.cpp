@@ -250,6 +250,11 @@ static int g_cutsceneRecenterFix = 1;
 static int g_vehicleExitRecenterFix = 0;
 static volatile LONG g_enginePatchesApplied = 0;
 
+// logic check to understand when the game has first loaded.  
+// This is so that the player is unarmed when the game loads, rather than having a weapon in hand.  
+// This is default functionality
+static bool g_game_has_started = false;
+
 using ScriptRegisterFn = void(*)(HMODULE, void(*)());
 using ScriptUnregisterFn = void(*)(HMODULE);
 using ScriptWaitFn = void(*)(DWORD);
@@ -1491,9 +1496,11 @@ static const int kKnownWeaponCount = sizeof(kKnownWeaponHashes) / sizeof(kKnownW
 static void SaveCurrentWeapons(int ped) {
     g_saved_weapon_count = 0;
     g_weapons_saved_valid = false;
+    
     for (int i = 0; i < kKnownWeaponCount && g_saved_weapon_count < kMaxSavedWeapons; ++i) {
         uint64_t args[3] = { (uint64_t)(uint32_t)ped, (uint64_t)kKnownWeaponHashes[i], 0ull };
         uint64_t out = 0;
+
         bool ok = InvokeNativeRaw(0x8DECB02F88F428BCull, args, 3, &out); // HAS_PED_GOT_WEAPON
         if (ok && out != 0) {
             int ammo = NativeInt2(0x015A522136D7F951ull, (uint64_t)(uint32_t)ped,
@@ -1503,39 +1510,45 @@ static void SaveCurrentWeapons(int ped) {
             g_saved_weapon_count++;
         }
     }
+
+    // NEW LOGIC
+
     // GET_SELECTED_PED_WEAPON(ped) -> currently equipped weapon hash
     uint64_t selArgs[1] = { (uint64_t)(uint32_t)ped };
     uint64_t selOut = 0;
     if (InvokeNativeRaw(0x0A6DB4965674D243ull, selArgs, 1, &selOut)) {
         g_saved_selected_weapon = (uint32_t)selOut;
-    } else {
-        g_saved_selected_weapon = 0;
+        CLog("Output of the selected weapon is : 0x%X", g_saved_selected_weapon);
     }
+        
     g_weapons_saved_valid = g_saved_weapon_count > 0;
     CLog("compat: saved %d weapon(s) for ped 0x%X, selected=0x%X", g_saved_weapon_count, ped, g_saved_selected_weapon);
+
 }
 
 // Re-give the snapshot taken by SaveCurrentWeapons(). Safe to call even if
 // nothing was saved (no-op).
 static void RestoreWeapons(int ped) {
     if (!g_weapons_saved_valid || g_saved_weapon_count <= 0) return;
-    for (int i = 0; i < g_saved_weapon_count; ++i) {
-        uint64_t args[5] = {
-            (uint64_t)(uint32_t)ped,
-            (uint64_t)g_saved_weapons[i].hash,
-            (uint64_t)(uint32_t)g_saved_weapons[i].ammo,
-            0ull, // isHidden
-            0ull  // equipNow (we set the selected weapon explicitly below)
-        };
-        InvokeNativeRaw(0xBF0FD6E56C964FCBull, args, 5, nullptr); // GIVE_WEAPON_TO_PED
+        for (int i = 0; i < g_saved_weapon_count; ++i) {
+            uint64_t args[5] = {
+                (uint64_t)(uint32_t)ped,
+                (uint64_t)g_saved_weapons[i].hash,
+                (uint64_t)(uint32_t)g_saved_weapons[i].ammo,
+                0ull, // isHidden
+                0ull  // equipNow (we set the selected weapon explicitly below)
+            };
+
+            InvokeNativeRaw(0xBF0FD6E56C964FCBull, args, 5, nullptr); // GIVE_WEAPON_TO_PED
     }
-    if (g_saved_selected_weapon != 0) {
-        NativeVoid3(0xADF692B254977C0Cull, (uint64_t)(uint32_t)ped,
-                    (uint64_t)g_saved_selected_weapon, 1ull); // SET_CURRENT_PED_WEAPON(equipNow=true)
-    }
-    CLog("compat: restored %d weapon(s) for ped 0x%X, selected=0x%X", g_saved_weapon_count, ped, g_saved_selected_weapon);
-    g_weapons_saved_valid = false;
-    g_saved_weapon_count = 0;
+        if (g_saved_selected_weapon != 0) {
+            NativeVoid3(0xADF692B254977C0Cull, (uint64_t)(uint32_t)ped,
+                (uint64_t)g_saved_selected_weapon, 1ull); // SET_CURRENT_PED_WEAPON(equipNow=true)
+        }
+        
+        CLog("compat: restored %d weapon(s) for ped 0x%X, selected=0x%X", g_saved_weapon_count, ped, g_saved_selected_weapon);
+        g_weapons_saved_valid = false;
+        g_saved_weapon_count = 0; 
 }
 
 // Snapshot the player's current wanted level before a model swap. Must be
@@ -1581,12 +1594,7 @@ static void InstantPlayerModelReset(const char* reason) {
             }
 
             CLog("compat instant model reset: restoring saved model 0x%X reason=%s", modelToRestore, reason ? reason : "-");
-
-            // Snapshot weapons/ammo BEFORE the swap - SET_PLAYER_MODEL recreates
-            // the ped with the new model's default (usually empty) loadout.
-            if (g_modelResetPreserveWeapons) {
-                SaveCurrentWeapons(ped);
-            }
+          
             // Same for wanted level - the recreated ped comes back with the
             // player's stars cleared unless we snapshot and re-apply them too.
             if (g_modelResetPreserveWantedLevel) {
@@ -1634,7 +1642,7 @@ static void InstantPlayerModelReset(const char* reason) {
             CLog("compat instant model reset: completed instantly - model loads in background, animations preserved");
         } else if (g_saved_player_model == 0) {
             CLog("compat instant model reset: ERROR - no saved model available");
-        }
+        }    
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         CLog("compat instant model reset: exception caught");
     }
@@ -2095,6 +2103,7 @@ static void CompatScriptMain() {
             // control-off period the same way (ControlLossHeadingFix).
             bool cutscenePlaying = NativeBool0(0xD3C2E180A40F031Eull, false); // IS_CUTSCENE_PLAYING
             bool controlOnNow = player >= 0 && NativeBool1(0x49C32D60007AFA47ull, (uint64_t)(uint32_t)player, true); // IS_PLAYER_CONTROL_ON
+            
 
             if (!cutscenePlaying && wasCutscenePlaying && g_cutsceneHeadingFix) {
                 cutsceneFixPendingFrames = g_cutsceneEndSettleFrames > 0 ? g_cutsceneEndSettleFrames : 1;
@@ -2284,6 +2293,7 @@ static void CompatScriptMain() {
                         g_saved_FOV3rd = *(uint64_t*)(rvrBase + 0x380A0);
                         g_saved_ViewInverse = *(uint64_t*)(rvrBase + 0x37FD0);
                         g_continuations_captured = true;
+
                         CLog("captured continuations: Proj=0x%llX FOV1stCar=0x%llX CamParams=0x%llX FOVUni=0x%llX FOV3rd=0x%llX ViewInverse=0x%llX",
                              (unsigned long long)g_saved_Proj, (unsigned long long)g_saved_FOV1stCar,
                              (unsigned long long)g_saved_CamParams, (unsigned long long)g_saved_FOVUni,
@@ -2300,6 +2310,32 @@ static void CompatScriptMain() {
                 SyncVehicleFirstPersonCamera("vehicle-entry");
                 vehView = NativeInt0(0xA4FF579AC0E3AAAEull, vehView);
             }
+
+            // NEW LOGIC
+
+            // need to check if the player is trying to enter a vehicle
+            // we do this check here as the engine automatically assigns the player a weapon as soon as we get in a vehicle.
+            // if we call SaveCurrentWeapons later, the player is already in the "GET_IN_VEHICLE" state has been assigned a weapon.  So when you get out of the vehicle you are armed, even if you werent when you entered
+            if (!cameraGrace && !inVeh) {
+                uint64_t args[1] = { (uint64_t)(uint32_t)ped };
+                uint64_t out = 0;
+
+                InvokeNativeRaw(0x814FA8BE5449445D, args, 1, &out); // check GET_VEHICLE_PED_IS_TRYING_TO_ENTER
+
+                int vehicleTryingToEnter = (int)out;
+
+                bool isAboutToEnterVehicle = (vehicleTryingToEnter != 0);
+
+                if (isAboutToEnterVehicle) {
+                    int ped = NativeInt0(0xD80958FC74E988A6ull, 0); // PLAYER::PLAYER_PED_ID()
+                    if (ped != 0) { // check the player is real first
+                        SaveCurrentWeapons(ped); 
+                    }
+                }
+            }
+
+
+            // END NEW LOGIC
 
             // CAPTURE PLAYER MODEL AND APPEARANCE BEFORE ENTERING VEHICLE
             // This ensures we use the EXACT model and clothes when exiting, not a generic/parent model
