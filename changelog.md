@@ -1,3 +1,11 @@
+**v1.2.6  Weapon Component (Attachment) Restore**
+
+-   Fixed: weapon attachments (suppressors, scopes, grips, extended clips, flashlights, Mk2 barrels/camos, etc) disappearing from the weapon wheel after exiting a vehicle. `SaveCurrentWeapons`/`RestoreWeapons` previously only snapshotted each weapon's hash and ammo count, so `GIVE_WEAPON_TO_PED` reissued a bare weapon with none of its attachments after the vehicle-exit model reset.
+
+-   `SaveCurrentWeapons` now also checks `HAS_PED_GOT_WEAPON_COMPONENT` for every known component against each carried weapon and records the ones that are actually fitted (added `kKnownComponentHashes`, 273 entries covering every component in the game).
+
+-   `RestoreWeapons` now re-applies each saved weapon's recorded components via `GIVE_WEAPON_COMPONENT_TO_PED` immediately after re-giving that weapon.
+
 **v1.2.5  Early Weapon Snapshot**
 
 -   Fixed: weapon snapshot (`SaveCurrentWeapons`) is now taken when `GET_VEHICLE_PED_IS_TRYING_TO_ENTER` becomes true — before the engine's "get in vehicle" sequence assigns weapons to the ped — rather than at model-reset time. Previously, calling `SaveCurrentWeapons` after that sequence had already run meant the engine-assigned weapons were included in the restore, so a player who entered a vehicle unarmed would exit it armed.

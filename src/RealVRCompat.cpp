@@ -98,9 +98,18 @@ static bool g_pending_delayed_is_motorcycle = false;
 // original vehicle-exit fix never accounted for this. We snapshot the loadout
 // immediately before the model swap and re-give it back at the same point we
 // already restore appearance (once the falling animation finishes).
+// Attachments (suppressor, scope, grip, extended clip, flashlight, etc) live
+// separately from the weapon itself - HAS_PED_GOT_WEAPON/GIVE_WEAPON_TO_PED
+// only deal with the base weapon, so a snapshot that only stores hash+ammo
+// silently drops every attachment. GIVE_WEAPON_TO_PED does NOT re-attach
+// components already on the ped for that weapon, so components must be
+// snapshotted and re-given explicitly, same as the base weapon.
+static const int kMaxComponentsPerWeapon = 8;
 struct SavedWeapon {
     uint32_t hash;
     int ammo;
+    uint32_t components[kMaxComponentsPerWeapon];
+    int componentCount;
 };
 static const int kMaxSavedWeapons = 64;
 static SavedWeapon g_saved_weapons[kMaxSavedWeapons];
@@ -1490,6 +1499,290 @@ static const uint32_t kKnownWeaponHashes[] = {
 };
 static const int kKnownWeaponCount = sizeof(kKnownWeaponHashes) / sizeof(kKnownWeaponHashes[0]);
 
+// All known weapon component hashes (suppressors, scopes, grips, extended
+// clips, flashlights, muzzle brakes, camo/finish variants, Mk2 attachments,
+// etc), across every weapon in the game. HAS_PED_GOT_WEAPON_COMPONENT is
+// checked per (weapon, component) pair below, so a generic "every component
+// that exists" list works fine - invalid combinations for a given weapon
+// just report false and are skipped.
+static const uint32_t kKnownComponentHashes[] = {
+    0xFA8FA10Fu, // AdvancedRifleClip01
+    0x8EC1C979u, // AdvancedRifleClip02
+    0x377CD377u, // AdvancedRifleVarmodLuxe
+    0x31C4B22Au, // APPistolClip01
+    0x249A17D5u, // APPistolClip02
+    0x9B76C72Cu, // APPistolVarmodLuxe
+    0xBE5EEA16u, // AssaultRifleClip01
+    0xB1214F9Bu, // AssaultRifleClip02
+    0xDBF0A53Du, // AssaultRifleClip03
+    0x4EAD7533u, // AssaultRifleVarmodLuxe
+    0x8D1307B0u, // AssaultSMGClip01
+    0xBB46E417u, // AssaultSMGClip02
+    0x278C78AFu, // AssaultSMGVarmodLowrider
+    0x94E81BC7u, // AssaultShotgunClip01
+    0x86BD7F72u, // AssaultShotgunClip02
+    0x0C164F53u, // AtArAfGrip
+    0x7BC4CDDCu, // AtArFlsh
+    0x837445AAu, // AtArSupp
+    0xA73D4664u, // AtArSupp02
+    0x359B7AAEu, // AtPiFlsh
+    0xC304849Au, // AtPiSupp
+    0x65EA7EBBu, // AtPiSupp02
+    0x75414F30u, // AtRailCover01
+    0xD2443DDCu, // AtScopeLarge
+    0x1C221B1Au, // AtScopeLargeFixedZoom
+    0x9D2FBF29u, // AtScopeMacro
+    0x3CC6BA57u, // AtScopeMacro02
+    0xBC54DA77u, // AtScopeMax
+    0xA0D89C42u, // AtScopeMedium
+    0xAA2C45B4u, // AtScopeSmall
+    0x3C00AFEDu, // AtScopeSmall02
+    0xE608B35Eu, // AtSrSupp
+    0xC5A12F80u, // BullpupRifleClip01
+    0xB3688B0Fu, // BullpupRifleClip02
+    0xA857BC78u, // BullpupRifleVarmodLow
+    0xC94E550Eu, // BullpupShotgunClip01
+    0x9FBE33ECu, // CarbineRifleClip01
+    0x91109691u, // CarbineRifleClip02
+    0xBA62E935u, // CarbineRifleClip03
+    0xD89B9658u, // CarbineRifleVarmodLuxe
+    0xE1FFB34Au, // CombatMGClip01
+    0xD6C59CD6u, // CombatMGClip02
+    0x92FECCDDu, // CombatMGVarmodLowrider
+    0x4317F19Eu, // CombatPDWClip01
+    0x334A5203u, // CombatPDWClip02
+    0x6EB8C8DBu, // CombatPDWClip03
+    0x0721B079u, // CombatPistolClip01
+    0xD67B4F2Du, // CombatPistolClip02
+    0xC6654D72u, // CombatPistolVarmodLowrider
+    0x513F0A63u, // CompactRifleClip01
+    0x59FF9BF8u, // CompactRifleClip02
+    0xC607740Eu, // CompactRifleClip03
+    0x29EA741Eu, // DBShotgunClip01
+    0xE4E4C28Du, // FireworkClip01
+    0x93E9BD99u, // FlareGunClip01
+    0xDDB7390Fu, // FlashlightLight
+    0x11AE5C97u, // GrenadeLauncherClip01
+    0x1CE5A6A5u, // GusenbergClip01
+    0xEAC8C270u, // GusenbergClip02
+    0x0D4A969Au, // HeavyPistolClip01
+    0x64F9C62Bu, // HeavyPistolClip02
+    0x7A6A7B7Bu, // HeavyPistolVarmodLuxe
+    0x324F2D5Fu, // HeavyShotgunClip01
+    0x971CF6FDu, // HeavyShotgunClip02
+    0x88C7DA53u, // HeavyShotgunClip03
+    0x476F52F4u, // HeavySniperClip01
+    0xF8132D3Fu, // HomingLauncherClip01
+    0xEED9FD63u, // KnuckleVarmodBallas
+    0xF3462F33u, // KnuckleVarmodBase
+    0x9761D9DCu, // KnuckleVarmodDiamond
+    0x50910C31u, // KnuckleVarmodDollar
+    0x7DECFE30u, // KnuckleVarmodHate
+    0xE28BABEFu, // KnuckleVarmodKing
+    0x3F4E8AA6u, // KnuckleVarmodLove
+    0xC613F685u, // KnuckleVarmodPimp
+    0x08B808BBu, // KnuckleVarmodPlayer
+    0x7AF3F785u, // KnuckleVarmodVagos
+    0xF434EF84u, // MGClip01
+    0x82158B47u, // MGClip02
+    0xD6DABABEu, // MGVarmodLowrider
+    0x476E85FFu, // MachinePistolClip01
+    0xB92C6979u, // MachinePistolClip02
+    0xA9E9CAF4u, // MachinePistolClip03
+    0xCB9E41EDu, // MarksmanPistolClip01
+    0xD83B4141u, // MarksmanRifleClip01
+    0xCCFD2AC5u, // MarksmanRifleClip02
+    0x161E9241u, // MarksmanRifleVarmodLuxe
+    0xCB48AEF0u, // MicroSMGClip01
+    0x10E6BA2Bu, // MicroSMGClip02
+    0x487AAE09u, // MicroSMGVarmodLuxe
+    0xC8DE6F06u, // MinigunClip01
+    0x4ED2073Fu, // MusketClip01
+    0x2297BE19u, // Pistol50Clip01
+    0xD9D3AC92u, // Pistol50Clip02
+    0x77B8AB2Fu, // Pistol50VarmodLuxe
+    0xFED0FD71u, // PistolClip01
+    0xED265A1Cu, // PistolClip02
+    0xD7391086u, // PistolVarmodLuxe
+    0xC5A30FEDu, // PoliceTorchFlashlight
+    0xD16F1438u, // PumpShotgunClip01
+    0xA2D79DDBu, // PumpShotgunVarmodLowrider
+    0x4EA573B3u, // RPGClip01
+    0x0384F3E8u, // RailgunClip01
+    0xE9867CE3u, // RevolverClip01
+    0x16EE3040u, // RevolverVarmodBoss
+    0x9493B80Du, // RevolverVarmodGoon
+    0x26574997u, // SMGClip01
+    0x350966FBu, // SMGClip02
+    0x79C77076u, // SMGClip03
+    0x27872C90u, // SMGVarmodLuxe
+    0xF8802ED9u, // SNSPistolClip01
+    0x7B0033B3u, // SNSPistolClip02
+    0x8033ECAFu, // SNSPistolVarmodLowrider
+    0xC7D62225u, // SawnoffShotgunClip01
+    0x85A64DF9u, // SawnoffShotgunVarmodLuxe
+    0x9BC64089u, // SniperRifleClip01
+    0x4032B5E7u, // SniperRifleVarmodLuxe
+    0xC6C7E581u, // SpecialCarbineClip01
+    0x7C8BD10Eu, // SpecialCarbineClip02
+    0x6B59AEAAu, // SpecialCarbineClip03
+    0x730154F2u, // SpecialCarbineVarmodLowrider
+    0x9137A500u, // SwitchbladeVarmodBase
+    0x5B3E7DB6u, // SwitchbladeVarmodVar1
+    0xE7939662u, // SwitchbladeVarmodVar2
+    0x45A3B6BBu, // VintagePistolClip01
+    0x33BA12E8u, // VintagePistolClip02
+    0x420FD713u, // AtSights
+    0x3F3C8181u, // AtScopeSmallMk2
+    0x049B2945u, // AtScopeMacroMk2
+    0xC66B6542u, // AtScopeMediumMk2
+    0xB99402D4u, // AtMuzzle1
+    0xC867A07Bu, // AtMuzzle2
+    0xDE11CBCFu, // AtMuzzle3
+    0xEC9068CCu, // AtMuzzle4
+    0x02E7957Au, // AtMuzzle5
+    0x347EF8ACu, // AtMuzzle6
+    0x4DB62ABEu, // AtMuzzle7
+    0x9D65907Au, // AtArAfGrip2
+    0x94F42D62u, // PistolMk2ClipNormal
+    0x5ED6C128u, // PistolMk2ClipExtended
+    0x4F37DF2Au, // PistolMk2ClipFMJ
+    0x85FEA109u, // PistolMk2ClipHollowpoint
+    0x2BBD7A3Au, // PistolMk2ClipIncendiary
+    0x25CAAEAFu, // PistolMk2ClipTracer
+    0x8ED4BB70u, // PistolMk2Scope
+    0x43FD595Bu, // PistolMk2Flash
+    0x21E34793u, // PistolMk2Compensator
+    0x5C6C749Cu, // PistolMk2CamoDigital
+    0x15F7A390u, // PistolMk2CamoBrushstroke
+    0x968E24DBu, // PistolMk2CamoWoodland
+    0x017BFA99u, // PistolMk2CamoSkull
+    0xF2685C72u, // PistolMk2CamoSessanta
+    0xDD2231E6u, // PistolMk2CamoPerseus
+    0xBB43EE76u, // PistolMk2CamoLeopard
+    0x4D901310u, // PistolMk2CamoZebra
+    0x5F31B653u, // PistolMk2CamoGeometric
+    0x697E19A0u, // PistolMk2CamoBoom
+    0x930CB951u, // PistolMk2CamoPatriotic
+    0xB4FC92B0u, // PistolMk2CamoSlideDigital
+    0x1A1F1260u, // PistolMk2CamoSlideBrushstroke
+    0xE4E00B70u, // PistolMk2CamoSlideWoodland
+    0x2C298B2Bu, // PistolMk2CamoSlideSkull
+    0xDFB79725u, // PistolMk2CamoSlideSessanta
+    0x6BD7228Cu, // PistolMk2CamoSlidePerseus
+    0x9DDBCF8Cu, // PistolMk2CamoSlideLeopard
+    0xB319A52Cu, // PistolMk2CamoSlideZebra
+    0xC6836E12u, // PistolMk2CamoSlideGeometric
+    0x43B1B173u, // PistolMk2CamoSlideBoom
+    0x4ABDA3FAu, // PistolMk2CamoSlidePatriotic
+    0x8610343Fu, // AssaultRifleMk2ClipNormal
+    0xD12ACA6Fu, // AssaultRifleMk2ClipExtended
+    0xA7DD1E58u, // AssaultRifleMk2ClipArmorPiercing
+    0x63E0A098u, // AssaultRifleMk2ClipFMJ
+    0xFB70D853u, // AssaultRifleMk2ClipIncendiary
+    0xEF2C78C1u, // AssaultRifleMk2ClipTracer
+    0x43A49D26u, // AssaultRifleMk2BarrelNormal
+    0x5646C26Au, // AssaultRifleMk2BarrelHeavy
+    0x911B24AFu, // AssaultRifleMk2CamoDigital
+    0x37E5444Bu, // AssaultRifleMk2CamoBrushstroke
+    0x538B7B97u, // AssaultRifleMk2CamoWoodland
+    0x25789F72u, // AssaultRifleMk2CamoSkull
+    0xC5495F2Du, // AssaultRifleMk2CamoSessanta
+    0xCF8B73B1u, // AssaultRifleMk2CamoPerseus
+    0xA9BB2811u, // AssaultRifleMk2CamoLeopard
+    0xFC674D54u, // AssaultRifleMk2CamoZebra
+    0x7C7FCD9Bu, // AssaultRifleMk2CamoGeometric
+    0xA5C38392u, // AssaultRifleMk2CamoBoom
+    0xB9B15DB0u, // AssaultRifleMk2CamoPatriotic
+    0x4C7A391Eu, // CarbineRifleMk2ClipNormal
+    0x5DD5DBD5u, // CarbineRifleMk2ClipExtended
+    0x255D5D57u, // CarbineRifleMk2ClipArmorPiercing
+    0x44032F11u, // CarbineRifleMk2ClipFMJ
+    0x3D25C2A7u, // CarbineRifleMk2ClipIncendiary
+    0x1757F566u, // CarbineRifleMk2ClipTracer
+    0x833637FFu, // CarbineRifleMk2BarrelNormal
+    0x8B3C480Bu, // CarbineRifleMk2BarrelHeavy
+    0x4BDD6F16u, // CarbineRifleMk2CamoDigital
+    0x406A7908u, // CarbineRifleMk2CamoBrushstroke
+    0x2F3856A4u, // CarbineRifleMk2CamoWoodland
+    0xE50C424Du, // CarbineRifleMk2CamoSkull
+    0xD37D1F2Fu, // CarbineRifleMk2CamoSessanta
+    0x86268483u, // CarbineRifleMk2CamoPerseus
+    0xF420E076u, // CarbineRifleMk2CamoLeopard
+    0xAAE14DF8u, // CarbineRifleMk2CamoZebra
+    0x9893A95Du, // CarbineRifleMk2CamoGeometric
+    0x6B13CD3Eu, // CarbineRifleMk2CamoBoom
+    0xDA55CD3Fu, // CarbineRifleMk2CamoPatriotic
+    0x492B257Cu, // CombatMGMk2ClipNormal
+    0x17DF42E9u, // CombatMGMk2ClipExtended
+    0x29882423u, // CombatMGMk2ClipArmorPiercing
+    0x57EF1CC8u, // CombatMGMk2ClipFMJ
+    0xC326BDBAu, // CombatMGMk2ClipIncendiary
+    0xF6649745u, // CombatMGMk2ClipTracer
+    0xC34EF234u, // CombatMGMk2BarrelNormal
+    0xB5E2575Bu, // CombatMGMk2BarrelHeavy
+    0x4A768CB5u, // CombatMGMk2CamoDigital
+    0xCCE06BBDu, // CombatMGMk2CamoBrushstroke
+    0xBE94CF26u, // CombatMGMk2CamoWoodland
+    0x7609BE11u, // CombatMGMk2CamoSkull
+    0x48AF6351u, // CombatMGMk2CamoSessanta
+    0x9186750Au, // CombatMGMk2CamoPerseus
+    0x84555AA8u, // CombatMGMk2CamoLeopard
+    0x1B4C088Bu, // CombatMGMk2CamoZebra
+    0x0E046DFCu, // CombatMGMk2CamoGeometric
+    0x028B536Eu, // CombatMGMk2CamoBoom
+    0xD703C94Du, // CombatMGMk2CamoPatriotic
+    0xFA1E1A28u, // HeavySniperMk2ClipNormal
+    0x2CD8FF9Du, // HeavySniperMk2ClipExtended
+    0xF835D6D4u, // HeavySniperMk2ClipArmorPiercing
+    0x89EBDAA7u, // HeavySniperMk2ClipExplosive
+    0x3BE948F6u, // HeavySniperMk2ClipFMJ
+    0x0EC0F617u, // HeavySniperMk2ClipIncendiary
+    0x82C10383u, // HeavySniperMk2ScopeLarge
+    0xB68010B0u, // HeavySniperMk2ScopeNightvision
+    0x2E43DA41u, // HeavySniperMk2ScopeThermal
+    0xAC42DF71u, // HeavySniperMk2Suppressor
+    0x5F7DCE4Du, // HeavySniperMk2Muzzle8
+    0x6927E1A1u, // HeavySniperMk2Muzzle9
+    0x909630B7u, // HeavySniperMk2BarrelNormal
+    0x108AB09Eu, // HeavySniperMk2BarrelHeavy
+    0xF8337D02u, // HeavySniperMk2CamoDigital
+    0xC5BEDD65u, // HeavySniperMk2CamoBrushstroke
+    0xE9712475u, // HeavySniperMk2CamoWoodland
+    0x13AA78E7u, // HeavySniperMk2CamoSkull
+    0x26591E50u, // HeavySniperMk2CamoSessanta
+    0x302731ECu, // HeavySniperMk2CamoPerseus
+    0xAC722A78u, // HeavySniperMk2CamoLeopard
+    0xBEA4CEDDu, // HeavySniperMk2CamoZebra
+    0xCD776C82u, // HeavySniperMk2CamoGeometric
+    0xABC5ACC7u, // HeavySniperMk2CamoBoom
+    0x6C32D2EBu, // HeavySniperMk2CamoPatriotic
+    0x4C24806Eu, // SMGMk2ClipNormal
+    0xB9835B2Eu, // SMGMk2ClipExtended
+    0x0B5A715Fu, // SMGMk2ClipFMJ
+    0x3A1BD6FAu, // SMGMk2ClipHollowpoint
+    0xD99222E5u, // SMGMk2ClipIncendiary
+    0x7FEA36ECu, // SMGMk2ClipTracer
+    0x9FDB5652u, // SMGMk2Sights
+    0xE502AB6Bu, // SMGMk2ScopeMacro
+    0x3DECC7DAu, // SMGMk2ScopeSmall
+    0xD9103EE1u, // SMGMk2BarrelNormal
+    0xA564D78Bu, // SMGMk2BarrelHeavy
+    0xC4979067u, // SMGMk2CamoDigital
+    0x3815A945u, // SMGMk2CamoBrushstroke
+    0x4B4B4FB0u, // SMGMk2CamoWoodland
+    0xEC729200u, // SMGMk2CamoSkull
+    0x48F64B22u, // SMGMk2CamoSessanta
+    0x35992468u, // SMGMk2CamoPerseus
+    0x24B782A5u, // SMGMk2CamoLeopard
+    0xA2E67F01u, // SMGMk2CamoZebra
+    0x2218FD68u, // SMGMk2CamoGeometric
+    0x45C5C3C5u, // SMGMk2CamoBoom
+    0x399D558Fu, // SMGMk2CamoPatriotic
+};
+static const int kKnownComponentCount = sizeof(kKnownComponentHashes) / sizeof(kKnownComponentHashes[0]);
+
+
 // Snapshot the ped's current loadout (which weapons + how much ammo) before a
 // model swap. Must be called BEFORE SET_PLAYER_MODEL - the new ped starts
 // unarmed, so this is the last point the old loadout can still be read.
@@ -1507,6 +1800,22 @@ static void SaveCurrentWeapons(int ped) {
                                    (uint64_t)kKnownWeaponHashes[i], 0); // GET_AMMO_IN_PED_WEAPON
             g_saved_weapons[g_saved_weapon_count].hash = kKnownWeaponHashes[i];
             g_saved_weapons[g_saved_weapon_count].ammo = ammo;
+
+            // Check every known component against this weapon and record
+            // whichever ones the ped actually has fitted (suppressor, scope,
+            // grip, extended clip, flashlight, etc).
+            int compCount = 0;
+            for (int c = 0; c < kKnownComponentCount && compCount < kMaxComponentsPerWeapon; ++c) {
+                uint64_t compArgs[3] = { (uint64_t)(uint32_t)ped, (uint64_t)kKnownWeaponHashes[i], (uint64_t)kKnownComponentHashes[c] };
+                uint64_t compOut = 0;
+                bool compOk = InvokeNativeRaw(0xC593212475FAE340ull, compArgs, 3, &compOut); // HAS_PED_GOT_WEAPON_COMPONENT
+                if (compOk && compOut != 0) {
+                    g_saved_weapons[g_saved_weapon_count].components[compCount] = kKnownComponentHashes[c];
+                    compCount++;
+                }
+            }
+            g_saved_weapons[g_saved_weapon_count].componentCount = compCount;
+
             g_saved_weapon_count++;
         }
     }
@@ -1540,6 +1849,17 @@ static void RestoreWeapons(int ped) {
             };
 
             InvokeNativeRaw(0xBF0FD6E56C964FCBull, args, 5, nullptr); // GIVE_WEAPON_TO_PED
+
+            // GIVE_WEAPON_TO_PED does not restore attachments - re-give each
+            // component we saw on this weapon at snapshot time.
+            for (int c = 0; c < g_saved_weapons[i].componentCount; ++c) {
+                uint64_t compArgs[3] = {
+                    (uint64_t)(uint32_t)ped,
+                    (uint64_t)g_saved_weapons[i].hash,
+                    (uint64_t)g_saved_weapons[i].components[c]
+                };
+                InvokeNativeRaw(0xD966D51AA5B28BB9ull, compArgs, 3, nullptr); // GIVE_WEAPON_COMPONENT_TO_PED
+            }
     }
         if (g_saved_selected_weapon != 0) {
             NativeVoid3(0xADF692B254977C0Cull, (uint64_t)(uint32_t)ped,
