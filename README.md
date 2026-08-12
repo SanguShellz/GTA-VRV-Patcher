@@ -33,7 +33,6 @@
 
 ## 🛠️ Troubleshooting: 
 
-- Turn on the controller before launching the game with the VR mod; otherwise, the game will not detect any input.
 - If you see this error:
 	
 	> CORE: An exception occurred while executing 'RealVR.asi', id 4
