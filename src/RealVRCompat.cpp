@@ -1914,10 +1914,29 @@ static void InstantPlayerModelReset(const char* reason) {
             }
 
             CLog("compat instant model reset: restoring saved model 0x%X reason=%s", modelToRestore, reason ? reason : "-");
-          
+
+            // Snapshot the current loadout before the swap - the new ped comes
+            // back unarmed otherwise. Unlike wanted level this applies to EVERY
+            // reset reason including death/arrest: vanilla GTA V keeps your
+            // weapons through a wasted/busted respawn, so there's no case where
+            // skipping this is correct. Must happen here, right before the
+            // model change below, rather than relying on whatever the last
+            // vehicle-entry snapshot happened to capture, which can be stale or
+            // missing entirely if the player died on foot.
+            if (g_modelResetPreserveWeapons) {
+                SaveCurrentWeapons(ped);
+            }
+
             // Same for wanted level - the recreated ped comes back with the
             // player's stars cleared unless we snapshot and re-apply them too.
-            if (g_modelResetPreserveWantedLevel) {
+            // IMPORTANT: only do this for resets that are pure technical
+            // workarounds (vehicle-exit, cutscene-end) where the wanted level
+            // shouldn't be touched at all. On death/arrest, GTA's own
+            // wasted/busted -> hospital/station flow is *supposed* to clear
+            // the wanted level - snapshotting it here and reapplying it after
+            // respawn would fight that and leave the player wanted forever.
+            bool isDeathOrArrestReset = reason && (strstr(reason, "death") || strstr(reason, "arrest"));
+            if (g_modelResetPreserveWantedLevel && !isDeathOrArrestReset) {
                 SaveCurrentWantedLevel(playerId);
             }
 

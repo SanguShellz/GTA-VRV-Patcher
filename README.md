@@ -2,7 +2,8 @@
 
 **Provides compatibility for the GTA V RealVR mod on newer GTA V Legacy builds.**
 
-## ℹ️ Compatibility
+## ℹ️ Compatibility:
+
 - `GTA-VRV-Patcher` has been tested and confirmed to work with `Steam` versions of `GTA V Legacy`:
   `v1.0.2845`, s`v1.0.3751`, `v1.0.3788.0`, and `v1.0.3889.0`.
 - Other versions newer than `v1.0.2612` may also work.
@@ -12,13 +13,26 @@
 - Oculus Runtime (OVR) crashes.
 
 ## 💾 Installation:
+
+**Download:**
+- [GTAVRV.Patcher.v1.2.7.Release.zip](https://github.com/SanguShellz/GTA-VRV-Patcher/releases/download/1.2.7/GTAVRV.Patcher.v1.2.7.Release.zip)
+- Extract the archive
+- Move the extracted files into the game directory.
+- Note: The 00_ prefix for `00_RealVRCompat.asi` so that it loads before `RealVR.asi
+
+**Default Install Locations:**
+- **Steam:** `C:\Program Files (x86)\Steam\steamapps\common\Grand Theft Auto V`
+- **Epic Game Store:** `C:\Program Files\Epic Games\Grand Theft Auto V`
+- **RockStar Games Launcher:**  `C:\Program Files\Rockstar Games\Grand Theft Auto V`
+
+**Setup:**
+-  [Requires latest version of Script Hook V](https://www.dev-c.com/gtav/scripthookv/)
 - Run GTA V Legacy once to create a `settings.xml` 
 - Extract the archive and copy the mod files into the GTA V Legacy game folder
 - run `RealConfig.bat`
-- Requires latest Script Hook V: [https://www.dev-c.com/gtav/scripthookv/](https://www.dev-c.com/gtav/scripthookv/)
-- The 00_ prefix for `00_RealVRCompat.asi` so that it loads before `RealVR.asi
 
 ## 🛠️ Troubleshooting: 
+
 - Turn on the controller before launching the game with the VR mod; otherwise, the game will not detect any input.
 - If you see this error:
 	
@@ -26,11 +40,13 @@
 
 	It's likely 'asi\realvr.asi exists from a previous setup.  Delete it.
 
-## ⚙️ Configuration
+## ⚙️ Configuration:
+
 - Settings for `GTA V RealVR Patcher` are configured in `RealVRCompat.ini
 - Additonal settings for the `GTA V Real VR` mod are configured in `RealVR.ini`
 
-## 📦 Building
+## 📦 Building:
+
 **️Prerequisites**:
 - Visual Studio 2026
 - ScriptHookV SDK
@@ -43,5 +59,6 @@ cd "path\to\project"
 ```
 Output: `bin\00_RealVRCompat.asi`
 
-## 📋 License
+## 📋 License:
+
 See [LICENSE.txt](LICENSE.txt)

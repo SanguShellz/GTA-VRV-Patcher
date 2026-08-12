@@ -1,4 +1,8 @@
-**v1.2.6  Weapon Component (Attachment) Restore**
+**v1.2.7 Wanted Level Fix**
+
+- Fixed: Wanted level (police stars) no longer persists after dying or getting busted. `ModelResetPreserveWantedLevel` was snapshotting the wanted level on every `InstantPlayerModelReset()`, including death/arrest resets, then reapplying it after respawn - overriding the game's own wasted/busted wanted-level clear. The snapshot/restore now only applies to vehicle-exit and cutscene resets, where it's needed to counteract the model swap; death and arrest resets let the game clear stars naturally.
+
+**v1.2.5  Weapon Component (Attachment) Restore**
 
 -   Fixed: weapon attachments (suppressors, scopes, grips, extended clips, flashlights, Mk2 barrels/camos, etc) disappearing from the weapon wheel after exiting a vehicle. `SaveCurrentWeapons`/`RestoreWeapons` previously only snapshotted each weapon's hash and ammo count, so `GIVE_WEAPON_TO_PED` reissued a bare weapon with none of its attachments after the vehicle-exit model reset.
 
