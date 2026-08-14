@@ -1,3 +1,8 @@
+> [!important]
+> **THIS REPOSITORY IS NO LONGER MAINTAINED**
+>
+> *There will be no further updates, bug fixes, or new features for this fork.*
+
 <h1>GTA V RealVR Patcher<br><sub><sup><em>RealVRCompat ASI</em></sup></sub></h1>
 
 **Provides compatibility for the GTA V RealVR mod on newer GTA V Legacy builds.**
