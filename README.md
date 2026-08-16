@@ -17,6 +17,12 @@
 - OpenVR or OpenXR Runtimes work depending on the HMD (OpenVR [VRAPI = 2] is the default in RealVR.ini). 
 - Oculus Runtime (OVR) crashes.
 
+## ⚠️ Known Issues:
+- Currently this patcher works best for free-roam gameplay.  
+- Right stick camera control gets disabled after some types of cutscenes.
+- Heading gets turned around after some types of cutscenes.  
+- There may be compatibility issues with certain types of mods that interact with the player character such as `Player Companion`, etc.
+
 ## 💾 Installation:
 
 **Download:**
