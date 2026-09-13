@@ -22,6 +22,7 @@
 - Right stick camera control gets disabled after some types of cutscenes.
 - Heading gets turned around after some types of cutscenes.  
 - There may be compatibility issues with certain types of mods that interact with the player character such as `Player Companion`, etc.
+- The right-stick camera fix reloads the character from a snapshot captured before entering a vehicle. Anything not explicitly included in that snapshot isn’t restored, and any changes or states that occur while in the vehicle aren’t captured either.
 
 ## 💾 Installation:
 
